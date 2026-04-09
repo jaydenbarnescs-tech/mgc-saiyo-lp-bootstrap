@@ -19,6 +19,96 @@ This is the philosophical opposite of the old `saiyo-lp-skill` which had "always
 
 ---
 
+## CRITICAL CONSTRAINTS — never violate these
+
+These are non-negotiable. They come from hard lessons in the predecessor `saiyo-lp-skill` plus the cloq build. Every single one cost an hour+ to discover the first time and WILL silently break the skill if ignored.
+
+### 1. NEVER touch Matsuo-san's services or directories
+
+The Oracle Cloud VM runs multiple services in parallel. Some are Matsuo-san's (completely separate product, different codebase, different clients). Writing to any of these paths WILL break production for Matsuo-san's team and is treated as a severity-1 incident.
+
+**Forbidden paths** (read-only at most, never write, never restart, never `git pull`):
+- `/home/ubuntu/mgc-connector-hub/` — Matsuo-san's connector hub
+- `/home/ubuntu/nippo-sync-koko/` — Matsuo-san's Koko variant of nippo-sync (NOT the same as `/home/ubuntu/nippo-sync/` which is Jayden's)
+- `/home/ubuntu/line-harness-oss/` — Matsuo-san's LINE CRM harness
+
+**Forbidden systemd services** (never `systemctl restart/stop/start`, never tail their logs with intent to modify):
+- `mgc-connector-hub.service` (port 8443)
+- `line-crm.service` (port 3002)
+- `n8n-koko.service` (port 5679) — NOT the same as `n8n.service` which is ours
+
+**Jayden's paths (safe to write)**:
+- `/home/ubuntu/nippo-sync/` — Jayden's nippo-sync repo
+- `/home/ubuntu/mgc-saiyo-lp-bootstrap/` — this skill
+- `/home/ubuntu/mgc-pass-proxy/` — the MGC proxy server
+- `/home/ubuntu/mgc-research-agent/`, `/home/ubuntu/mgc-docs/`, `/home/ubuntu/mgc-accelerator-hub/`, `/home/ubuntu/mgc-translation-*/`
+
+**Jayden's services (safe to touch)**:
+- `nippo-sync.service` (if it exists as a local dev server; prod runs on Vercel)
+- `mgc-pass-proxy.service`
+- `n8n.service` (port 5678 — the main one)
+
+When in doubt: `systemctl status <name>` is read-only and always safe. Writing, restarting, or modifying is only for the explicit list above.
+
+### 2. NEVER add the `spreadsheets` OAuth scope back
+
+Our Google OAuth consent screen is in **Production mode** (published, no verification, no 100-user cap, no warning banner) specifically because every scope we request is **non-sensitive**:
+- `drive.file`
+- `userinfo.email`
+- `openid`
+
+Adding `https://www.googleapis.com/auth/spreadsheets` — or ANY scope Google classifies as "sensitive" — instantly kicks us into Google's verification track, which requires demo videos, privacy policy review, and 4+ weeks of back-and-forth. Existing clients get an "unverified app" warning banner and we're capped at 100 test users until verified. **This is the single most expensive mistake we can make with OAuth.**
+
+`drive.file` is sufficient for everything we do because:
+- `spreadsheets.create` is covered (drive.file grants create for app-created files)
+- `spreadsheets.values.append` + `batchUpdate` + `get` are all covered on files the app created
+- `drive.permissions.create` (for sharing with invited admins) is covered on app-created files
+
+The ONE thing `drive.file` can't do is touch files that WEREN'T created by our app. That's fine — we never need to.
+
+**Precedent**: commit `d933495` — dropped `spreadsheets` from the scopes, republished consent screen, zero verification required.
+
+### 3. NEVER use fire-and-forget `(async () => {...})()` in any Vercel API route
+
+Vercel serverless functions kill unawaited async work the moment the function returns its response. An IIFE like `;(async () => { await sheetSync() })()` will silently never run in production even though the Vercel logs say the function returned 200. The `await` inside the IIFE never completes because the process is already being torn down.
+
+**Rule**: any async side effect in an `/api/*` route must be either:
+- `await`'d inline (preferred — adds ~500ms-1s latency but actually reliable)
+- Wrapped in `waitUntil()` from `@vercel/functions` (use when latency is critical and you genuinely don't care about the result)
+
+**Never** use bare IIFEs for side effects. Precedents:
+- `b261c5b` — sheet sync was fire-and-forget, silently never ran for real submissions; only the manual `/sync` endpoint ever wrote to the sheet, which is why Jayden saw test entries but new submissions never appeared in the Google Sheet until debugging
+- `d3ef7e1` — notification email had the same bug; entries succeeded in the DB but no email was ever sent
+
+When adding new API routes in this skill or in nippo-sync, grep for `;(async` and `catch(() => {})` patterns — those are landmines.
+
+### 4. NEVER name static LP fallback files `index.html` in `/public/lp/{slug}/`
+
+Next.js static files in `/public/` take precedence over dynamic app router routes. If you drop `/public/lp/{slug}/index.html` or `/public/lp/{slug}/entry/index.html`, Vercel's static file handler serves it BEFORE the `/app/lp/[slug]/route.ts` or `/app/lp/[slug]/entry/route.ts` handler ever gets a chance. The dynamic route appears to never fire. You redeploy. Same result. You check the file, it's right. Nothing works.
+
+**Rule**: always name static LP fallbacks `_legacy-index.html.bak` or something else that doesn't end in `index.html`. Keep them in the repo as safety fallbacks that the route handler can `readFile` on error — but never let them BE the route.
+
+**Precedent**: commits `4645fca` (yamaguchi static file was intercepting the Phase 5 dynamic route) and `166d3b8` (cloq entry form was hardcoded to yamaguchi because `public/lp/yamaguchi/entry/index.html` took precedence over the dynamic `/app/lp/[slug]/entry/route.ts`).
+
+**Corollary for `next.config.js` rewrites**: any `afterFiles` rewrite for `/lp/:slug/:sub → /lp/:slug/:sub/index.html` will ALSO intercept the app router. Use `fallback` (runs after dynamic routes fail) instead of `afterFiles` (runs before dynamic routes). Precedent: `df6d566`.
+
+### 5. NEVER tell the user "done" after deploy without curl verification
+
+After every `git push` that changes LP rendering or a public route, verify with:
+```bash
+curl -sI https://nippo-sync.vercel.app/lp/{slug}          # expect 200
+curl -s https://nippo-sync.vercel.app/lp/{slug} | grep {client_name_marker}   # expect match
+curl -s https://nippo-sync.vercel.app/lp/{slug} | grep 'og:title'             # expect real client title, not 日報シンクロくん
+```
+
+If any check fails, roll back BEFORE reporting success. Don't trust Vercel's "deployment successful" message — that just means the build compiled, not that the route actually works.
+
+### 6. NEVER commit real PII without consent
+
+If the user provides real employee names, photos, or quotes during a build, confirm before pushing to the public Vercel URL. The LPs are publicly indexable (except admin pages which have `robots: noindex`). Once it's on the internet and crawled, it's on the internet forever.
+
+---
+
 ## Trigger
 
 The skill activates when the user clearly wants a new 採用LP built from a reference URL. The reliable signals are:
@@ -265,6 +355,37 @@ The Vercel API credentials (`VERCEL_TOKEN`, `VERCEL_PROJECT_ID`, `VERCEL_TEAM_ID
 
 **RULE 13 — OG metadata is already baked in — never inherit root layout defaults.** Both `lp-render.ts` (main LP + jobs detail page as raw HTML via route.ts) and `app/lp/[slug]/admin/page.tsx` (React page via `generateMetadata`) set explicit `og:title`, `og:description`, `og:site_name`, `og:image`, `twitter:*`, and `<link rel=icon>` tags pulled from `lp_content`. Never add new top-level LP routes without also setting these tags — otherwise they'll inherit the root layout's `'日報シンクロくん'` default and leak legacy branding into link previews. The admin page's generateMetadata also sets `robots: { index: false, follow: false }` so admin URLs never show up in search engines. Verify new routes with `curl $URL | grep og:title` before shipping.
 
+**RULE 14 — Images should be 融合 of original style + generated content, NOT reused homepage photos.** The cloq build violated this on first pass — I grabbed images from cloq.jp's existing pages and stuck them on the 採用LP as-is. That's lazy and produces a LP that looks like a 切り貼り (cut-and-paste) of the client's existing site. The correct approach:
+
+1. **KEEP the style** from the reference site: colors, typography, layout feel, logo placement, section hierarchy. These come from `extract_design.py` + Aura + the scraped CSS tokens. Don't touch.
+2. **GENERATE new images** based on the company's actual concepts via nano-banana-proxy skill. The prompt should reference what makes THIS company THIS company: their industry, their values (from `bundle.representative_message` + `business_descriptions`), their culture (from scraped job_details 求める人物像). A recruitment consultancy's 採用LP hero should show "recruitment consulting with candidates in a modern Kyoto office", not their homepage's generic business banner.
+3. **USE scraped photos only when they're genuinely workspace-specific** — actual building exteriors, actual desks with people working, actual team photos. NOT marketing hero banners, NOT stock-photo-looking abstracts, NOT the site's og:image. The test: "would this photo make sense in a job-seeker context?" Building photo = yes. Homepage hero banner = no.
+4. **Position images** (one per opening) should be **generated fresh per role** via nano-banana. A "採用支援スタッフ" role gets an image of a support staffer working with candidates; a "採用クリエイター" role gets an image of a writer at a laptop drafting copy. NOT a generic homepage image used twice.
+5. **About photo** can be a real company building photo if one exists, otherwise generate.
+6. **Voices[].photo** — always generated placeholders unless the client provides real employee photos with consent. Flag as `voices_photo: "ai_placeholder"` in provenance.
+
+The image pipeline hasn't been folded into `scripts/` yet — it's a manual step invoking the `nano-banana-proxy` skill after the text content is inserted. Until it's folded in: document it in the polish checklist at handoff and actually RUN the generation before declaring the LP ready to hand over. **Never ship a LP with pure scraped-homepage-reuse images.**
+
+**RULE 15 — NEVER use the `spreadsheets` OAuth scope or any other sensitive scope.** See Critical Constraints #2 above. This is a non-negotiable: adding it back kicks us into Google's verification track and costs weeks of calendar time. `drive.file` + `userinfo.email` + `openid` is the complete allowed list. If a future feature seems to need `spreadsheets` scope, find a way to do it with `drive.file` instead — the app is always the creator of any sheet it touches, and `drive.file` is sufficient for every operation on app-created files.
+
+**RULE 16 — NEVER use fire-and-forget IIFE patterns in Vercel API routes.** See Critical Constraints #3. Any async side effect in `/api/*` must be `await`'d inline or wrapped in `waitUntil()`. The Vercel lambda kills unawaited async the moment the function returns.
+
+**RULE 17 — NEVER name static LP fallbacks `index.html`.** See Critical Constraints #4. Always use `_legacy-index.html.bak` or similar. Static files in `/public/` override dynamic app router routes.
+
+**RULE 18 — drive.file revoke recovery via `/api/admin/reset-lp-claim`.** When a client revokes the app's grant in their Google account permissions page (https://myaccount.google.com/permissions), ALL drive.file file-authorizations are wiped for that user. The sheet itself remains in their Drive but every subsequent API call returns 404 even though the file is right there. This is a Google security property, not a bug.
+
+**Recovery path** (one-shot, gated by migration secret):
+```bash
+curl -X POST "https://nippo-sync.vercel.app/api/admin/reset-lp-claim?slug={slug}" \
+  -H "x-migration-secret: $(doppler secrets get MIGRATION_SECRET --project nippo-syncro-kun --config dev --plain)"
+```
+
+This deletes the `lp_admins` owner row + `lp_sheet_configs` row for the slug. `lp_entries` are left intact. The next sign-in runs the claim flow fresh and creates a new sheet that the refreshed Google grant can access.
+
+**BUT**: if `lps.handed_over_at` is already set, the ?first URL is burned and only `lp_admins` DELETE + ALSO setting `handed_over_at = NULL` will allow a fresh claim. Be explicit with the user about this emergency override and log why it was needed.
+
+Precedent: commit `65c6992` — endpoint added during Phase 3 debugging after Jayden revoked access during testing.
+
 ---
 
 ## Verification gate (skill is "done" when these all pass)
@@ -359,7 +480,51 @@ This is the full list of every issue we hit across the 10-turn session that buil
 | 27 | **Bootstrap sheets in Jayden's Drive get orphaned on every handover** | After each client claims, the old sheet is still in Jayden's Drive but no longer linked in `lp_sheet_configs` — clutter accumulates | By design — the new flow replaces the sheet pointer, doesn't delete the file | Manual: Jayden deletes them from Drive when he feels like it. A quarterly cleanup is fine | ⚠️ Manual housekeeping |
 | 28 | **No way to monitor OAuth callback errors post-hoc** | If a handover fails we have no way to see what went wrong from Claude's side | No Vercel logs API in Claude's MCP toolset | Manual: check Vercel logs in the dashboard if handover reports errors | ⚠️ Manual debugging |
 
-### Category 10 — Things that worked but could trip us next time
+### Category 10 — Vercel serverless constraints (from predecessor saiyo-lp-skill + nippo-sync git history)
+
+These pre-date this session but were never in my retrospective. Reading the predecessor's SKILL.md and nippo-sync git log surfaced them.
+
+| # | Hiccup | Symptom | Root cause | Fix commit | Automatic now? |
+|---|---|---|---|---|---|
+| 32 | **Fire-and-forget IIFEs silently die on Vercel** | Sheet sync for new form submissions never ran in prod — only the manual `/sync` endpoint worked. Notification emails for applications also never sent | Vercel serverless kills any unawaited async work the moment the lambda returns its response. `;(async () => { ... })()` patterns the inner `await` never completes because the process is already being torn down | `b261c5b` (sheet sync) + `d3ef7e1` (notification email) — both switched from IIFE to awaited-inline. +500ms-1s latency but actually reliable. RULE 16 enforces this going forward | ✅ For existing routes. ⚠️ Manual vigilance for new routes — grep for `;(async` before shipping |
+| 33 | **Vercel 4.5MB request body limit breaks image uploads** | Client uploads a >4.5MB photo via ImageField in the admin editor. Server returns HTML from Vercel's edge proxy ("Request Entity Too Large" / 413) instead of JSON. Frontend crashes on `JSON.parse` with "Unexpected token R, 'Request En...'" | Vercel's platform limit on request body size is 4.5MB, inflexible on Hobby + Pro. Multipart upload has to flow through the serverless function | `8090f74` + `fd2bfbd` — signed-URL 2-step upload pattern: (1) client POSTs small JSON `{filename, contentType, size}` to `/api/lp/[slug]/admin/upload-sign`, (2) server validates auth + returns a Supabase Storage signed upload URL via service-role client, (3) client PUTs the actual file directly to Supabase Storage (bypasses Vercel entirely), (4) client POSTs the resulting public URL back to update `lp_content` | ✅ Automatic for images uploaded via the admin editor |
+
+### Category 11 — Email delivery (from predecessor saiyo-lp-skill)
+
+| # | Hiccup | Symptom | Root cause | Fix commit | Automatic now? |
+|---|---|---|---|---|---|
+| 34 | **Gmail SMTP rewrites the `From` header** | n8n Send Email node is configured with `fromEmail: "noreply@mgc-global01.com"`, but emails arrive showing From `jayden.barnes.cs@gmail.com`. Client sees "Reply-To: noreply@..." as a demoted secondary | `smtp.gmail.com` with app-password auth forces the envelope From to match the authenticated user — anti-spoofing policy, not a bug | Use display-name override: `"株式会社X 採用通知" <jayden.barnes.cs@gmail.com>`. Recipients see the company brand in inbox preview; the personal Gmail is only visible on expand. Alternatively, configure "Send mail as" in Gmail Settings → Accounts and Import (authorizes the other address, allows native sending) | ⚠️ Manual — the display-name workaround is baked into `n8n-koko` notification workflows, but if you ever build a new notification path, apply the same pattern |
+| 35 | **Resend free-tier trial mode rejects multi-recipient sends** | Sending a notification email to 2+ admins via Resend's default `onboarding@resend.dev` sender returns HTTP 403 `validation_error: "You can only send testing emails to your own email address"`. The ENTIRE send fails, not just the extra recipients | Resend's free trial restricts To-list to the Resend account owner's email only. Any other recipient in the list triggers the 403 for the whole request | Three options: (A) verify a custom domain at resend.com/domains with DNS SPF/DKIM/return-path — most work; (B) set `RESEND_TRIAL_MODE_RECIPIENT` env var to override all recipients to the owner email (lossy — all admins get redirected to one mailbox); (C) route notifications through n8n + Gmail SMTP instead (what Phase 4 nippo-sync does). Current production uses option C for notifications and option B for invites. Commit `8662ff2` | ✅ Documented. New notification paths should use n8n SMTP, not Resend |
+
+### Category 12 — Next.js routing gotchas (from predecessor saiyo-lp-skill)
+
+| # | Hiccup | Symptom | Root cause | Fix commit | Automatic now? |
+|---|---|---|---|---|---|
+| 36 | **Static files in `/public/` override dynamic app router routes** | Added `/app/lp/[slug]/route.ts` expecting it to dynamically render LPs. Visiting `/lp/yamaguchi` still served the old static content. File is right, route handler appears to never fire | Vercel's static file handler serves `/public/lp/yamaguchi/index.html` BEFORE the app router gets a chance to match. Also applies to subpages: `/public/lp/yamaguchi/entry/index.html` overrides `/app/lp/[slug]/entry/route.ts` | Rename static fallbacks to `_legacy-index.html.bak`. The route handler can still `readFile` them as a safety fallback if the DB row is missing. NEVER use `index.html` as the filename. Commits `4645fca` (yamaguchi fix) + `166d3b8` (cloq entry form fix). RULE 17 enforces this going forward | ✅ Automatic now that both yamaguchi and cloq legacy files are renamed. ⚠️ New LPs must follow the naming convention |
+| 37 | **`next.config.js` rewrite order matters** | The admin page `/lp/:slug/admin` was being intercepted by a catch-all static rewrite `/lp/:slug/:sub → /lp/:slug/:sub/index.html` before the app router could match it | `afterFiles` rewrites fire BEFORE dynamic routes. `fallback` rewrites fire AFTER dynamic routes. The admin page needed to match an app router page, so the rewrite had to be in `fallback`, not `afterFiles` | Commit `df6d566` moved the LP static rewrites from `afterFiles` to `fallback`. Now: `/lp/yamaguchi/admin` → app router page (wins), `/lp/yamaguchi/entry` → app router route (wins), legacy static `.bak` files are only served if both static AND dynamic routes miss | ✅ Automatic — but if you add new rewrites to `next.config.js`, prefer `fallback` unless you specifically want to override dynamic routes |
+
+### Category 13 — Admin / invite flow (drive.file constraints)
+
+| # | Hiccup | Symptom | Root cause | Fix commit | Automatic now? |
+|---|---|---|---|---|---|
+| 38 | **Invitees can't see the sheet even after sign-in** | Owner claims LP, sheet is created, sheet appears in owner's Drive. Owner invites a teammate via admin dashboard. Teammate signs in, sees the dashboard, but clicking "View Sheet" returns 404 from Drive API | `drive.file` OAuth scope is per-user-per-app — it only grants access to files the app created on behalf of THAT specific user. So the invitee's drive.file token sees nothing, because the sheet wasn't created on behalf of them | Commit `895747e` — when an admin is invited, use the OWNER's drive.file token to call the Drive API permissions endpoint (`POST /files/{id}/permissions`) and explicitly share the sheet with the invitee's email as a writer. `drive.file` is sufficient for this because the file was created by the app on behalf of the owner — drive.file grants read/write/share/delete on app-created files. Helpers in `src/lib/sheets.ts`: `shareSheetWithEmail` and `unshareSheetWithEmail` | ✅ Automatic in the invite flow |
+| 39 | **Revoking the app in Google permissions wipes all file authorizations** | Client revokes access via https://myaccount.google.com/permissions ("Apps with access to your account" → Remove). The Google Sheet stays in their Drive, but every Drive API call from the app returns 404 even though the file is right there | `drive.file` is per-user-per-app. When the user revokes the app, ALL file authorizations for that user+app combo are wiped. The files remain but the app has zero grants on them. Re-signing in gives a fresh grant, but the OLD files are still orphaned from the app's perspective — a new grant does NOT re-attach to old files | Recovery endpoint `/api/admin/reset-lp-claim?slug={slug}` (commit `65c6992`) — deletes `lp_admins` owner row + `lp_sheet_configs`, leaves `lp_entries` intact. Next sign-in creates a fresh sheet that the new grant can access. Gated by `x-migration-secret` header. **NOT automatic detection** — the app can't tell the difference between "file doesn't exist" and "you've been revoked". Manual invocation required | ⚠️ Manual recovery. See RULE 18 for the full recovery procedure |
+
+### Category 14 — Pre-session hiccups documented in the predecessor skill
+
+These are from `/home/ubuntu/saiyo-lp-skill/SKILL.md`'s "Gotchas & Hard-Won Lessons" section. They ALL apply to this skill too — I just hadn't read them before the cloq build.
+
+| # | Predecessor lesson | Source | Now captured in this SKILL.md as |
+|---|---|---|---|
+| 40 | Vercel fire-and-forget IIFE | `saiyo-lp-skill/SKILL.md` Gotcha 1 | Critical Constraint #3 + RULE 16 + Category 10 hiccup 32 |
+| 41 | Gmail SMTP From rewrite | `saiyo-lp-skill/SKILL.md` Gotcha 2 | Category 11 hiccup 34 |
+| 42 | drive.file per-user-per-app + revoke recovery | `saiyo-lp-skill/SKILL.md` Gotcha 3 | RULE 18 + Category 13 hiccups 38 and 39 |
+| 43 | Resend free-tier trial mode | `saiyo-lp-skill/SKILL.md` Gotcha 4 | Category 11 hiccup 35 |
+| 44 | Next.js static files override dynamic routes | `saiyo-lp-skill/SKILL.md` Gotcha 5 | Critical Constraint #4 + RULE 17 + Category 12 hiccup 36 |
+| 45 | drive.file CAN share files (via Drive API permissions endpoint) | `saiyo-lp-skill/SKILL.md` Gotcha 6 | Category 13 hiccup 38 |
+| 46 | One sensitive OAuth scope taints the whole consent screen | `saiyo-lp-skill/SKILL.md` Gotcha 7 | Critical Constraint #2 + RULE 15 |
+
+### Category 15 — Things that worked but could trip us next time
 
 | # | Hiccup | Symptom | Root cause | Fix commit | Automatic now? |
 |---|---|---|---|---|---|
@@ -381,7 +546,7 @@ If something goes wrong post-bootstrap, check this list before digging:
 | Link preview shows "日報シンクロくん" | OG cache in the unfurler (Slack/iMessage/LINE), not a server bug — check the actual HTML via curl first | Use Slack's OG debugger OR add `?first&v=2` to bust iMessage's cache. Verify server-side with `curl $URL \| grep og:title` |
 | "Vercel Active" pill is green but DNS isn't actually working | You're reading the wrong Vercel field (`/v9.verified` is misleading) | Use `/v6/domains/{domain}/config.configuredBy` instead. RULE 12. |
 | `?first` URL shows "引き渡し済みです" unexpectedly | `lps.handed_over_at` is set. Check who claimed and when | If genuine: no reset, use invite flow. If emergency: `UPDATE lps SET handed_over_at=NULL WHERE slug='...'` via Supabase MCP — document it explicitly |
-| Client can't sign in via Google on `?first` | Consent screen still in "testing" mode, and client isn't on the test user list | Publish the OAuth consent screen in Google Cloud Console (requires app verification for sensitive scopes; our scopes are all non-sensitive so it's instant) |
+| Client can't sign in via Google on `?first` | Usually **not** a consent screen issue — our screen is in Production mode with only non-sensitive scopes, so any Google account can sign in with no warning. Check instead: (a) callback URL matches the registered redirect URI exactly `https://nippo-sync.vercel.app/api/sheets/connect/callback` in Google Cloud Console, (b) client's corporate Google Workspace doesn't block third-party apps (check with their IT), (c) `prompt=consent` is still set in `buildAuthUrl()` so they actually get a fresh refresh_token | Verify redirect URI in Google Cloud Console; if corporate Workspace blocks it, client signs in with personal Gmail instead |
 | Custom domain attach returns 402 | Vercel Pro account quota exceeded (100 domains/project cap on Pro) | Upgrade plan or detach unused domains first |
 | Sheet sync fires but `last_sync_status='error'` | Usually an expired access token where refresh also failed | Owner re-OAuth; check `last_sync_error` field for the exact Google API message |
 
@@ -389,7 +554,9 @@ If something goes wrong post-bootstrap, check this list before digging:
 
 ## Pre-flight check — run this BEFORE the next bootstrap
 
-Before building a NEW client LP, verify the environment is healthy:
+Before building a NEW client LP, verify the environment is healthy. Run this checklist start-to-finish:
+
+### A. Supabase health (5 checks)
 
 ```sql
 -- 1. Jayden has fresh Google tokens (for step 10.5 sheet creation)
@@ -401,26 +568,89 @@ from public.lp_admins
 where email = 'jayden.barnes@mgc-global01.com'
   and lp_slug = 'yamaguchi'  -- known-stable reference
 limit 1;
+-- Expected: has_refresh=true, access_valid=true (or false + plan to re-OAuth)
 
 -- 2. The lps master registry is reachable
-select count(*)::int as total_lps from public.lps;
+select count(*)::int as total_lps,
+       count(*) filter (where status='live')::int as live_lps,
+       count(*) filter (where handed_over_at is not null)::int as handed_over
+from public.lps;
+-- Expected: total_lps >= 2, live_lps >= 2, handed_over varies by client rollout state
 
 -- 3. Industry preset is loaded
 select industry, key from public.industry_presets limit 5;
+-- Expected: at least one row (製造業/default)
 
--- 4. Storage bucket exists
--- (run via Supabase dashboard: Storage → lp-assets → should exist, public read)
+-- 4. lp_content_revisions trigger is working
+select count(*)::int as total_revisions from public.lp_content_revisions;
+-- Expected: > 0 (each published LP has >= 1 revision)
+
+-- 5. No orphaned admin rows
+select lp_slug, email, role
+from public.lp_admins a
+where not exists (select 1 from public.lps where slug = a.lp_slug);
+-- Expected: zero rows
 ```
 
-Expected:
-- `has_refresh=true` and `access_valid=true` (or false + clear path for Jayden to re-OAuth)
-- `total_lps >= 2` (yamaguchi + cloq at minimum; more over time)
-- At least one `industry_presets` row exists (`製造業/default`)
-- `lp-assets` bucket is live
+### B. Vercel deployment health (3 checks)
 
-**If step 1 fails**: Jayden visits `/lp/yamaguchi/admin` → "Googleアカウントでサインイン" → done. Takes 10 seconds. This ALSO makes step 10.5 of the bootstrap work without skipping.
+```bash
+# 1. Production LP is serving
+curl -sI https://nippo-sync.vercel.app/lp/yamaguchi | head -1
+# Expected: HTTP/2 200
 
-**If step 2-4 fail**: something is wrong with Supabase — do NOT proceed with the bootstrap until fixed.
+# 2. OG meta tags not leaking 日報シンクロくん
+curl -s https://nippo-sync.vercel.app/lp/yamaguchi | grep -c '日報シンクロくん'
+# Expected: 0
+
+# 3. Vercel env vars needed by domain-attach are present
+# (run from the VM; reads Jayden's Vercel token from Doppler)
+VERCEL_TOKEN=$(doppler secrets get VERCEL_TOKEN --project nippo-syncro-kun --config dev --plain)
+curl -sk "https://api.vercel.com/v9/projects/prj_le2vOYHWk48qXpSiVzaMGIzDs2Dc/env?teamId=team_InumbXmdUdRp3WpMs47TFd8s" \
+  -H "Authorization: Bearer $VERCEL_TOKEN" | python3 -c "
+import json, sys
+envs = {e['key']: e['target'] for e in json.load(sys.stdin).get('envs', [])}
+needed = ['GOOGLE_CLIENT_ID', 'GOOGLE_CLIENT_SECRET', 'AUTH_SECRET', 'VERCEL_TOKEN', 'POSTGRES_URL_NON_POOLING', 'NEXT_PUBLIC_BASE_URL']
+for k in needed:
+  print(f'{"✓" if k in envs else "✗"} {k}')
+"
+# Expected: all 6 present
+```
+
+### C. Forbidden path safety (5 checks — Critical Constraint #1)
+
+```bash
+# Confirm none of Matsuo-san's services are touched by this session
+systemctl is-active mgc-connector-hub.service 2>/dev/null && echo "matsuo connector-hub: running (leave alone)" || echo "matsuo connector-hub: not on this VM or stopped"
+systemctl is-active line-crm.service 2>/dev/null && echo "matsuo line-crm: running (leave alone)" || echo "matsuo line-crm: not on this VM or stopped"
+systemctl is-active n8n-koko.service 2>/dev/null && echo "matsuo n8n-koko: running (leave alone)" || echo "matsuo n8n-koko: not on this VM or stopped"
+# Just READ the status. NEVER restart. If any are running, proceed carefully — do NOT `git pull` or `systemctl restart` anything under /home/ubuntu/mgc-connector-hub/, /home/ubuntu/nippo-sync-koko/, or /home/ubuntu/line-harness-oss/
+ls -la /home/ubuntu/nippo-sync/ > /dev/null && echo "✓ jayden's nippo-sync present"
+ls -la /home/ubuntu/mgc-saiyo-lp-bootstrap/ > /dev/null && echo "✓ bootstrap skill present"
+```
+
+### D. If the pre-flight fails
+
+- **A.1 fails (Jayden tokens missing)**: he visits `https://nippo-sync.vercel.app/lp/yamaguchi/admin` → clicks "Googleアカウントでサインイン" → refreshes his `google_refresh_token`. Takes 10 seconds. Step 10.5 of the bootstrap will then create the initial sheet successfully instead of skipping.
+- **A.2-5 fail**: something is wrong with Supabase — do NOT proceed with the bootstrap until fixed. Check `Supabase:get_logs` for errors.
+- **B fails**: check the Vercel deployment status in the dashboard; look for failed recent deploys. If `NEXT_PUBLIC_BASE_URL` is missing, set it to `https://nippo-sync.vercel.app` and redeploy.
+- **C shows Matsuo services running**: that's expected and normal. Just confirm this session does NOT write to their paths or restart their services.
+
+### E. Jayden's migration to Matsuo-san's Vercel Pro team (when ready)
+
+As of this writing, nippo-sync is on Jayden's Hobby account. The `domain-attach` endpoint is fully env-var driven, so the migration is a 6-step config change (no code):
+
+1. Matsuo-san invites Jayden to his Pro team (or transfers ownership — transfer is cleaner)
+2. Import/transfer the nippo-sync project to Matsuo-san's team via Vercel dashboard
+3. Read the NEW `projectId` + `teamId` from Matsuo-san's team dashboard (Settings → General → Project ID)
+4. Generate a NEW `VERCEL_TOKEN` scoped to Matsuo-san's team (https://vercel.com/account/tokens)
+5. Swap all 3 env vars on the Vercel deployment via the dashboard:
+   - `VERCEL_TOKEN` → new token
+   - `VERCEL_PROJECT_ID` → Matsuo-san's project ID
+   - `VERCEL_TEAM_ID` → Matsuo-san's team ID
+6. Redeploy (Vercel auto-redeploys on env var change)
+
+Zero client-side DNS changes needed — existing custom domains keep working because their CNAMEs point at `cname.vercel-dns.com` regardless of which team owns the project.
 
 ---
 
