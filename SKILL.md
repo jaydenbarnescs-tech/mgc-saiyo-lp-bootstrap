@@ -72,13 +72,21 @@ These are already in place as of 2026-04-09. The skill assumes them.
 | Thing | Where | Purpose |
 |---|---|---|
 | nippo-sync repo | `/home/ubuntu/nippo-sync/` (Jayden's) | Hosts the `/lp/[slug]` route + admin editor |
-| Supabase project | `pglaffdnhixmabcjdxbi` (`nippo-sync`) | Stores `lps`, `lp_content`, `industry_presets`, `lp_assets` |
-| Master registry | `public.lps` table | Source of truth for LP existence; insert here first with `created_via='skill'` |
-| Content storage | `public.lp_content` table | JSONB content blob keyed by `lp_slug` |
-| Admin access | `public.lp_admins` table | Auto-create owner row for `jayden.barnes@mgc-global01.com` so the dashboard works on first visit |
-| Upsert path | Supabase MCP `execute_sql` (preferred) or `apply_migration` for transactional safety | No HTTP endpoint or migration secret needed when running from Claude — direct DB access via MCP |
-| Storage bucket | `lp-assets` (public read) | Where all skill-generated images land |
-| Industry preset | `industry_presets` table, `製造業/default` row | Welfare items, data pills, hero EN titles for fallback |
+| nippo-sync prod | `https://nippo-sync.vercel.app` (Vercel project `prj_le2vOYHWk48qXpSiVzaMGIzDs2Dc`, team `team_InumbXmdUdRp3WpMs47TFd8s`) | Where the LPs actually live |
+| Supabase project | `pglaffdnhixmabcjdxbi` (`nippo-sync`) | Single source of truth for all LP data |
+| `public.lps` table | Master registry — one row per LP | `slug` PK, `client_name`, `status`, `reference_url`, `custom_domain`, `handed_over_at` (one-shot lock), `handed_over_by_email`, `domain_last_status`, `domain_last_checked_at`, `domain_last_error`, `created_via='skill'` |
+| `public.lp_content` table | JSONB content blob keyed by `lp_slug` | The rendered LP pulls from this. Has a trigger that auto-inserts into `lp_content_revisions` on UPDATE — every edit is audit-logged, so rollback is possible |
+| `public.lp_admins` table | Who can manage each LP | Insert Jayden as `owner` + `jayden.barnes.cs@gmail.com` as `member` on bootstrap. Stores `google_refresh_token` / `google_access_token` / `google_token_expiry` — this is where sheet sync auth lives |
+| `public.lp_entries` table | Form submissions from applicants | Append-only; bulk-delete button in dashboard for clearing test data |
+| `public.lp_sheet_configs` table | Google Sheet per LP | One row per slug; points at the sheet ID + URL + owner_email. Gets overwritten on client handover to point at a fresh sheet in the client's Drive |
+| `public.lp_content_revisions` | Auto-populated audit log | Populated by a trigger on `lp_content` UPDATE — no manual writes needed |
+| `public.industry_presets` | Welfare items, data pills, hero EN titles for fallback | Row `製造業/default` is the current fallback; eventually add `default/default` + per-industry rows |
+| `lp-assets` Storage bucket | Public-read, where all skill-generated images land | Long-term goal: every image URL in `lp_content` points here, not at the client's site |
+| Supabase MCP access | `execute_sql` + `apply_migration` | No HTTP endpoint or migration secret needed from Claude — direct DB access |
+| `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` | Vercel env + Doppler `nippo-syncro-kun/dev` | For OAuth during handover + sheet creation |
+| `VERCEL_TOKEN` | Vercel env (encrypted, all 3 targets) + Doppler `nippo-syncro-kun/dev` | Required by `/api/lp/[slug]/admin/domain-attach` to call Vercel Domains API |
+| `AUTH_SECRET` | Vercel env | HMAC signing key for OAuth state tokens + session cookies |
+| Google Cloud Console | OAuth consent screen + client credentials | Redirect URI: `https://nippo-sync.vercel.app/api/sheets/connect/callback`. Scopes: `drive.file`, `userinfo.email`, `openid`. Consent screen should be PUBLISHED (not in testing mode) so new clients can sign in without being on the allowlist |
 
 ---
 
@@ -161,11 +169,17 @@ The skill orchestrator is `scripts/bootstrap.py` on the VM at `/home/ubuntu/mgc-
     3. `INSERT INTO public.lp_admins (lp_slug, email, role)` for `jayden.barnes@mgc-global01.com` as `owner` AND `jayden.barnes.cs@gmail.com` as `member`. Without this row the `/lp/{slug}/admin` page treats the LP as nonexistent (the `fetchCompanyAndExists` function checks lp_admins as one of the existence signals).
     4. `UPDATE public.lps SET status = 'live' WHERE slug = '{slug}'`
 
-10.5. **Create Google Sheet for entries auto-sync** — read Jayden's existing Google OAuth tokens from `lp_admins` (he's already authorized for nippo-sync overall, so the tokens carry over to new slugs):
+10.5. **Create Google Sheet for entries auto-sync — BEST-EFFORT, not required** — read Jayden's existing Google OAuth tokens from `lp_admins` and try to create an initial sheet in Jayden's Drive. This gives Jayden a sheet to watch for any test entries between bootstrap and the client's handover — but it's **intentionally replaced** by a fresh sheet in the client's own Drive when they claim ownership via `/admin?first` (see step 12.5). So if this step fails for any reason (Jayden hasn't re-OAuthed recently, Google API 503, scope issue, quota), **continue the bootstrap anyway and log it in provenance as `sheet_initial: "failed"`**. The client will create their own sheet on handover regardless.
+
+    Pre-flight check: `SELECT google_refresh_token FROM lp_admins WHERE email='jayden.barnes@mgc-global01.com' LIMIT 1`. If NULL, skip this step entirely and log `sheet_initial: "skipped_no_tokens"` in provenance. Do NOT try to refresh — just skip.
+
+    If tokens exist:
     1. Fetch `google_access_token` for `jayden.barnes@mgc-global01.com`. If `google_token_expiry` < now, refresh it via `https://oauth2.googleapis.com/token` using `GOOGLE_CLIENT_ID` + `GOOGLE_CLIENT_SECRET` from Doppler (`nippo-syncro-kun/dev`) plus the stored refresh_token.
     2. POST to `https://sheets.googleapis.com/v4/spreadsheets` with `{"properties": {"title": "{client_name} - 採用エントリー", "locale": "ja_JP", "timeZone": "Asia/Tokyo"}, "sheets": [{"properties": {"title": "Entries"}}]}`. The sheet lands in jayden.barnes@mgc-global01.com's Drive.
     3. PUT the LP_ENTRY_HEADERS row to `/spreadsheets/{id}/values/Entries!A1?valueInputOption=USER_ENTERED`. Headers: `["ID","応募日時","LP Slug","会社名","お名前","メール","電話","職種","志望動機","ステータス","内部メモ","Source"]`
     4. INSERT into `public.lp_sheet_configs` with `connection_type='oauth'`, `auto_sync=true`, `worksheet_name='Entries'`, `last_sync_status='success'`, `last_synced_count=0`. After this, every form submission to `/api/lp-entry` will auto-append to the sheet via the existing handler logic.
+
+    **The old bootstrap sheets in Jayden's Drive become orphaned after each client handover.** They're not deleted — just no longer linked in `lp_sheet_configs`. Jayden can manually clean them up from his Drive once a quarter or so.
 11. **Verify** — GET `https://nippo-sync.vercel.app/lp/{slug}`, confirm 200 + content renders
 12. **Verify the admin entrypoint** — GET `https://nippo-sync.vercel.app/lp/{slug}/admin`, confirm it returns the ConnectScreen (sign-in prompt) and NOT the "LPが見つかりません" 404 screen. If the latter, the lp_admins insert in step 10.3 was skipped — go back and insert it.
 12.5. **First-setup URL is deterministic and OAuth-driven — no code changes needed** — as of `nippo-sync@53a7338` the client-handover URL is always `https://nippo-sync.vercel.app/lp/{slug}/admin?first`, no token, no expiry. Every LP in `public.lps` has this URL available immediately after the registry insertion in step 3 (the `lps` row creation).
@@ -226,6 +240,10 @@ The skill orchestrator is `scripts/bootstrap.py` on the VM at `/home/ubuntu/mgc-
 
 **RULE 6 — Images SHOULD go through lp-assets bucket (v1 goal).** The long-term target is that every image in `lp_content` is hosted on the `lp-assets` Supabase Storage bucket so we own our assets. For v0, raw scraped URLs from the client's site are acceptable as long as they're flagged in provenance — image migration runs as a follow-up step after the LP is verified live.
 
+**RULE 7 — Industry preset auto-update is OPT-IN.** After polishing, the system suggests "save these as the new {industry} default preset?" but never auto-saves.
+
+**RULE 8 — Reference URL is the client's OWN site by default.** A second `style_url` is optional and only affects design tokens (theme colors, font hints), never content.
+
 **RULE 9 — Audience pivot is mandatory before insert.** The composer is a structural draft, not the final content. Whenever the source site is a B2B service business (consulting, agency, SaaS, anything that sells *to other businesses*), its homepage paragraphs are pitching services to *clients*, NOT recruiting *job seekers*. Verbatim copying produces sales copy in the strengths section instead of employer branding. Claude MUST review and rewrite hero/about/strengths/cta from a job-seeker frame at workflow step 8.5 BEFORE the Supabase insert. The composer always sets `provenance.audience_pivot_review_needed: true` as a reminder — Claude flips it to false only after rewriting. The cloq pivot is the canonical example: client-facing "we deeply understand your hiring problem, we PDCA your funnel" was rewritten as candidate-facing "you'll get hands-on実務スキル, work in a flat 本音-driven team, in a 在宅可・服装自由 environment".
 
 **RULE 10 — Handover uses the `/admin?first` URL with Google OAuth as the primary path.** For first-time client handover, the skill returns the deterministic URL `/lp/{slug}/admin?first` in the handoff message (workflow step 13). The URL is always the same for a given slug and is always ready from the moment the `lps` row exists (step 3). The screen's primary CTA is a Google sign-in button — not an email form — because Google auth gives us three things the email flow can't: (a) verified email with zero typo risk, (b) fresh tokens to create a new sheet in the CLIENT's Drive (not Jayden's), and (c) permissions to drive the existing Google Sheets connector automatically. The OAuth callback atomically DEMOTEs Jayden's pre-seeded admin rows to `member` (preserving `google_refresh_token` so the old sheet is still accessible), UPSERTs the client as owner with THEIR tokens, creates a brand-new sheet in the client's Drive via `createSpreadsheet(clientAccessToken)`, copies existing entries, and sets the one-shot lock. An email-only fallback exists as a collapsible secondary option for clients without Google accounts — it deletes `lp_sheet_configs` since it can't create a new sheet without OAuth tokens, and the client connects Google Sheets from the dashboard later. **Never describe the first-setup URL as "an email form" — always describe it as "Google sign-in with email fallback".**
@@ -241,13 +259,11 @@ The skill orchestrator is `scripts/bootstrap.py` on the VM at `/home/ubuntu/mgc-
 5. Once `configuredBy` is non-null, the UI turns green showing the specific record type that's working, and Vercel auto-issues an SSL cert via Let's Encrypt within ~1 minute
 6. Until DNS is active, the dashboard surfaces the nippo-sync URL as the canonical share URL via the existing HTTP health check
 
-The Vercel API credentials (`VERCEL_TOKEN`, `VERCEL_PROJECT_ID`, `VERCEL_TEAM_ID`) are already in the Vercel project env vars as of turn 9. The defaults in code are `prj_le2vOYHWk48qXpSiVzaMGIzDs2Dc` / `team_InumbXmdUdRp3WpMs47TFd8s`.
+The Vercel API credentials (`VERCEL_TOKEN`, `VERCEL_PROJECT_ID`, `VERCEL_TEAM_ID`) are already in the Vercel project env vars. The defaults in code are `prj_le2vOYHWk48qXpSiVzaMGIzDs2Dc` / `team_InumbXmdUdRp3WpMs47TFd8s`.
 
 **DO NOT attempt to automate custom domain setup as part of the skill's workflow**, even if the user mentions a specific domain in their prompt. Reasons: (a) only the owner (client, post-handover) should be attaching domains to their LP, (b) DNS changes belong to the client's registrar and aren't something we can touch, (c) the Vercel API call is tied to a session cookie so it can only run post-login. If the user says "set up the domain recruit.cloq.jp", Claude should mention it in the handoff polish checklist as a recommended manual step the client should do from their dashboard.
 
-**RULE 7 — Industry preset auto-update is OPT-IN.** After polishing, the system suggests "save these as the new {industry} default preset?" but never auto-saves.
-
-**RULE 8 — Reference URL is the client's OWN site by default.** A second `style_url` is optional and only affects design tokens (theme colors, font hints), never content.
+**RULE 13 — OG metadata is already baked in — never inherit root layout defaults.** Both `lp-render.ts` (main LP + jobs detail page as raw HTML via route.ts) and `app/lp/[slug]/admin/page.tsx` (React page via `generateMetadata`) set explicit `og:title`, `og:description`, `og:site_name`, `og:image`, `twitter:*`, and `<link rel=icon>` tags pulled from `lp_content`. Never add new top-level LP routes without also setting these tags — otherwise they'll inherit the root layout's `'日報シンクロくん'` default and leak legacy branding into link previews. The admin page's generateMetadata also sets `robots: { index: false, follow: false }` so admin URLs never show up in search engines. Verify new routes with `curl $URL | grep og:title` before shipping.
 
 ---
 
@@ -263,6 +279,148 @@ The Vercel API credentials (`VERCEL_TOKEN`, `VERCEL_PROJECT_ID`, `VERCEL_TEAM_ID
 - [ ] All images served from `lp-assets` bucket
 - [ ] `lp_content_revisions` row created from the bootstrap (via the trigger that already exists)
 - [ ] Yamaguchi LP still works unchanged
+
+---
+
+## Known hiccups and lessons learned — the cloq build retrospective
+
+This is the full list of every issue we hit across the 10-turn session that built cloq, from first crawl to final handover-ready state. Each row is a real thing that broke or surprised us, with the fix commit and whether it's now automatic in the pipeline or still needs manual vigilance. **Read this once before running the skill on a new client so we don't re-learn the same lessons the hard way.**
+
+### Category 1 — Content extraction (crawl_reference.py)
+
+| # | Hiccup | Symptom | Root cause | Fix commit | Automatic now? |
+|---|---|---|---|---|---|
+| 1 | **Aura timed out on cloq.jp** | 120s hard timeout, no design tokens | Aura's hosted pipeline struggles on certain WordPress sites | `extract_design.py` CSS fallback | ✅ Fallback runs automatically via RULE 2 |
+| 2 | **`<dl>` pairs wrapped in `<div>` broke extraction** | `bundle.company_info` and `job_details` were empty; no 設立/代表者/業務内容 in the footer | cloq.jp's theme wraps every `<dt>`/`<dd>` pair in a `<div>` wrapper. The naive `dl > dt + dd` CSS selector missed all of them | `crawl_reference.py:collect_dl_pairs()` walks document order regardless of wrapper depth via `.find_all(['dt','dd'])` | ✅ Automatic |
+| 3 | **Footer fields (founded, representative, business_type) missing** | Footer showed generic defaults instead of "代表取締役 山口 浩希 / 2026年3月2日 / 人材紹介事業" | Composer didn't know about these fields — they weren't in `ContentBundle` | `crawl_reference.py` exposes `bundle.founded / .representative / .capital / .business_type`; `compose_lpcontent.py:compose_footer()` reads them | ✅ Automatic, tracked in provenance |
+| 4 | **Logo wasn't extracted, only a 34×34 letter badge** | Header showed a gradient "C" instead of the real CLOQ logo | `SKIP_IMAGE_PATTERNS` in `collect_images()` filtered anything with 'logo' in the src, and there was no dedicated logo extractor | `extract_logo()` + `extract_favicon()` helpers with a 7-strategy ladder (WordPress `custom-logo` class → brand-link `<a>` → generic `logo` class → header `<img alt=company>` → src match → largest favicon → apple-touch-icon), plus `header.logo_image` schema field and renderer ternary | ✅ Automatic, tracked as `provenance.logo: scraped / fallback_letter` |
+| 5 | **Only 1 placeholder opening was produced on first build** | Composer returned a single generic opening; yamaguchi has 2 fully-detailed positions with 8-line 募集要項 + Q&As + day-in-life | Composer didn't know how to promote dl-extracted `job_details` into `openings[0].detail.requirements` | `compose_openings()` now builds a real opening from `bundle.job_details` with 8-line requirements, cleaned title, point-extraction from 「方」 clauses | ✅ Automatic for a SINGLE opening. Multi-position clients (like cloq's 2 roles) still need Claude to hand-craft the second+ role with yamaguchi-level detail — composer only fills `openings[0]` structurally |
+| 6 | **Representative message had boilerplate leakage** | `about.paragraphs` contained generic "we value customer satisfaction" filler from the reference site | Source site mixes marketing copy with the representative message; no stripping | Still manual — Claude rewrites via audience pivot (step 8.5) | ⚠️ Manual via RULE 9 |
+
+### Category 2 — Content framing (audience pivot)
+
+| # | Hiccup | Symptom | Root cause | Fix commit | Automatic now? |
+|---|---|---|---|---|---|
+| 7 | **Strengths section read like sales copy** | cloq's LP said "we deeply understand your hiring problem, we PDCA your funnel" — talking to CLIENTS, not job seekers | Composer copied client-facing marketing copy verbatim from a B2B service site into employer-branding sections | RULE 9 + workflow step 8.5 — Claude must rewrite hero/about/strengths/cta from a job-seeker frame before insert. `provenance.audience_pivot_review_needed: true` flag as a reminder | ⚠️ **Manual, mandatory**. The flag is the enforcement mechanism — don't insert lp_content with the flag still true |
+
+### Category 3 — Database / existence checks
+
+| # | Hiccup | Symptom | Root cause | Fix commit | Automatic now? |
+|---|---|---|---|---|---|
+| 8 | **Admin page returned "LPが見つかりません"** | `/lp/cloq/admin` 404 even though the LP was live | `fetchCompanyAndExists` only checked `lp_entries` (zero entries on a brand-new LP) and `lp_admins` (no rows because bootstrap didn't insert them) | `nippo-sync@b15bee6` adds `public.lps` as a third existence signal + RULE in step 10.3 requiring `lp_admins` insert | ✅ Automatic in step 10.3 |
+| 9 | **`lp_admins` insert was missing on first cloq build** | Same symptom as #8 | Bootstrap script didn't insert the Jayden owner row | `nippo-sync@d2dd91a` + workflow step 10.3 requires explicit `INSERT INTO lp_admins` for Jayden (owner) and `.cs@gmail.com` (member) | ✅ Automatic if step 10.3 runs |
+
+### Category 4 — Entry form + dashboard UX
+
+| # | Hiccup | Symptom | Root cause | Fix commit | Automatic now? |
+|---|---|---|---|---|---|
+| 10 | **Entry form was hardcoded to yamaguchi** | `/lp/cloq/entry/` showed yamaguchi's positions in the dropdown | `public/lp/yamaguchi/entry/index.html` was a static HTML file, not dynamic | `nippo-sync@166d3b8` created `src/app/lp/[slug]/entry/route.ts` that reads `lp_content.openings.items[].title` and builds the dropdown dynamically. Legacy static file renamed to `_legacy-index.html.bak` | ✅ Automatic for ALL slugs |
+| 11 | **ConnectScreen said "first to sign in becomes owner"** | Misleading footer text — made clients think they just needed to Google sign in, not use the claim link | Legacy UX from before the claim flow existed | `nippo-sync@58f98b7` two-path ConnectScreen rewrite: path 1 (blue) = "初めてアクセスする方へ" → use claim link; path 2 (gray) = "既に管理者として招待されている方" → Google OAuth for re-auth | ✅ Automatic — no action needed |
+| 12 | **No bulk delete for test entries** | Client had to click each test entry one at a time to clean up | Missing feature | `nippo-sync@58f98b7` added `DELETE /api/lp/[slug]/admin/entries?all=true&confirm={slug}` + red "🗑️ 全削除" button with double-confirm in the dashboard | ✅ Ready for client use |
+
+### Category 5 — Claim token → `?first` URL evolution
+
+| # | Hiccup | Symptom | Root cause | Fix commit | Automatic now? |
+|---|---|---|---|---|---|
+| 13 | **Claim token flow required manual SQL** | Bootstrap finished but Claude had to manually `INSERT INTO lp_claim_tokens` to generate a handover URL | Token table was designed for multi-token management, which was overkill for the single-shot handover case | `nippo-sync@eb81779` replaced the entire token flow with a deterministic `/lp/{slug}/admin?first` URL — no token, no expiry, no SQL insert | ✅ URL is always ready from the moment the `lps` row exists |
+| 14 | **`reset_admins=true` wiped `google_refresh_token`** | After a test claim, Jayden's sheet sync stopped working because his admin row was `DELETE`d | The old claim flow used `DELETE FROM lp_admins` to reset owners. But `lp_admins` is where Google tokens live — delete wipes the tokens | `nippo-sync@0d54cb4` changed semantics from DELETE to DEMOTE (`UPDATE role='member' WHERE role='owner' AND email<>claimer`). Tokens stay intact on the demoted row | ✅ Automatic in the first-setup endpoint and the OAuth callback |
+| 15 | **Clicking the email-form `?first` URL burned the lock on typos** | If the client typed their email wrong, `handed_over_at` was set permanently with the bad email and there was no way to recover | The email form committed the lock as soon as the email was submitted — no atomic transaction, no "did they actually sign in" check | `nippo-sync@28c4cdb` made Google OAuth the primary path. Lock is now committed INSIDE the same atomic transaction as all the mutations in the OAuth callback. Just clicking the URL doesn't burn it — only a fully successful Google round-trip does | ✅ Automatic. RULE 11 enforces this for future edits |
+| 16 | **Old sheet was shared between Jayden and client post-handover** | Client's new form submissions landed in Jayden's Drive sheet — no separation | The old claim flow didn't create a new sheet; it just reused `lp_sheet_configs` pointing at Jayden's sheet | `nippo-sync@28c4cdb` OAuth callback now calls `createSpreadsheet(clientAccessToken, sheetTitle)` which creates the sheet in the CLIENT's Drive via their fresh tokens. Then `lp_sheet_configs` is UPSERTed to point at the new sheet ID, overwriting the old pointer | ✅ Automatic on first-claim handover |
+
+### Category 6 — OAuth plumbing
+
+| # | Hiccup | Symptom | Root cause | Fix commit | Automatic now? |
+|---|---|---|---|---|---|
+| 17 | **State token was 3-part; firstFlag had nowhere to live** | Callback had no way to distinguish "first-claim handover" from "existing admin sign-in" | Original state format was `slug.nonce.sig` — no room for flags | `nippo-sync@28c4cdb` added a 4-part format: `slug.nonce.firstFlag.sig` where `firstFlag='0'|'1'`. Callback has a `parseState()` helper that accepts both 3-part (legacy) and 4-part (new) for backwards compat | ✅ Automatic |
+| 18 | **`prompt=consent` required to always get `refresh_token`** | Google doesn't return a refresh_token on repeat auth unless you force-ask for consent | Google's default auth flow omits `refresh_token` if the user has already consented in the past | `buildAuthUrl()` in `google-oauth.ts` sets `prompt=consent` + `access_type=offline` always. Documented in callback as "this should never fire but handled defensively" | ✅ Automatic |
+| 19 | **Self-test wiped Jayden's tokens before the DEMOTE fix** | After turn 6 self-test, `lp_admins.jayden.barnes@mgc-global01.com.google_refresh_token` was NULL — sheet sync for cloq was broken until manual re-OAuth | Self-test ran the old DELETE-based claim path before I'd shipped the DEMOTE fix. Scar was a one-click re-OAuth via `/lp/cloq/admin` → Google sign-in | Never — this is a one-time scar. Jayden re-OAuthed manually in turn 11, verified by `lp_entries` test submission → `last_sync_status='success'` at 09:25:07 | ⚠️ **Pre-flight check**: step 10.5 now does `SELECT google_refresh_token FROM lp_admins WHERE email='jayden.barnes@mgc-global01.com'`. If NULL, step 10.5 skips instead of crashing. |
+
+### Category 7 — OG / link preview metadata
+
+| # | Hiccup | Symptom | Root cause | Fix commit | Automatic now? |
+|---|---|---|---|---|---|
+| 20 | **Link previews showed `日報シンクロくん`** | Pasting `/lp/cloq/admin?first` into Slack/iMessage unfurled as "日報シンクロくん" instead of "株式会社CLOQ" | Admin page is a React page that inherited the root `app/layout.tsx` default title; main LP (`/lp/{slug}`) had `<title>` and `<meta description>` but no `og:*` tags | `nippo-sync@93e4a7b` added `generateMetadata()` to the admin page (reads `lps.client_name` + `lps.handed_over_at` + hero bg + company name, branches on `?first` + lock state, sets `robots: noindex, nofollow`). `nippo-sync@93e4a7b` also added full OG + Twitter Card tags to BOTH head blocks in `lp-render.ts` (main LP + jobs detail) pulling from `lp_content.meta/header/hero` | ✅ Automatic for all slugs. RULE 13 enforces this for future routes |
+| 21 | **Literal `日報シンクロくん` string leaked via an HTML comment** | Even after fixing the meta tags, a body-scan link preview crawler could still find the legacy brand name in my explanation comment | I wrote `<!-- ... override default "日報シンクロくん" title ... -->` as an explanatory comment, which ships to the browser | `nippo-sync@9f929ee` scrubbed both comments to a generic `<!-- Open Graph / Twitter Card metadata for link unfurling -->` | ✅ Lesson: never write the legacy brand string into any shipped file, even in comments |
+| 22 | **Unfurl caches don't refresh automatically** | First time we paste the fixed URL into an existing Slack thread, the old preview still shows because Slack caches for ~30min / iMessage indefinitely / LINE ~1 week | Not a bug, just how link preview caches work | Workarounds: Slack debugger (https://api.slack.com/reflection/og-debugger), add `?first&v=2` throwaway param to bypass iMessage cache, paste in new chat to refresh LINE | ⚠️ **Manual**: mention this to the user when handing off. First paste always wins; subsequent changes need a cache bust |
+
+### Category 8 — Custom domain / Vercel automation
+
+| # | Hiccup | Symptom | Root cause | Fix commit | Automatic now? |
+|---|---|---|---|---|---|
+| 23 | **Custom domain was just a text field with no action** | User could save a domain but there was no way to actually make it work without SSH'ing into Vercel or using the CLI | Initial implementation was schema-only | `nippo-sync@28c4cdb` added `POST/GET/DELETE /api/lp/[slug]/admin/domain-attach` that wraps Vercel's `/v10/projects/{id}/domains` API. Dashboard shows a 3-step flow: 保存 → Vercelに登録する → DNS instructions with copy buttons → 確認 button | ✅ Client-driven from dashboard. RULE 12 forbids the skill from auto-attaching |
+| 24 | **Vercel's `/v9` `verified: true` is misleading** | UI showed "✓ Vercel Active" on a freshly-attached domain even though DNS didn't point at Vercel yet | Vercel's `/v9/projects/{id}/domains/{name}.verified` means "attached to project without TXT challenge needed", NOT "DNS actually resolves to Vercel's edge". Tested by POSTing `mgc-vercel-api-test-delete-me.com` (bogus domain) → `verified: true` immediately | `nippo-sync@53a7338` switched to `/v6/domains/{domain}/config.configuredBy` which returns `'A' \| 'CNAME' \| 'HTTP' \| null`. That's the real DNS signal. `buildStatus()` now merges both endpoints' responses | ✅ Automatic. RULE 12 documents the gotcha |
+| 25 | **`VERCEL_TOKEN` was missing from the Vercel project env** | `domain-attach` endpoint would have returned a 500 the first time it was called on production | Bootstrap never added Vercel API creds to the Vercel project itself, only to Doppler | Added via Vercel API in turn 10: `POST /v10/projects/{id}/env` with `VERCEL_TOKEN` as encrypted, targeting production + preview + development. Now part of the Required Infrastructure table | ✅ Already done; new runs inherit it |
+| 26 | **TXT verification records for owned apex domains** | Some domains require an extra TXT `_vercel.{apex}` record when the apex was previously on another Vercel account | Vercel security — they need to prove the client owns the apex before subdomain ownership transfers | `buildDnsInstructions()` + UI render the `vercel_verification` array when present, with copy buttons. Tested this real path with `recruit.mgc-global01.com` which returned a real pending_domain_verification entry | ✅ Automatic |
+
+### Category 9 — Sheet sync / operational scars
+
+| # | Hiccup | Symptom | Root cause | Fix commit | Automatic now? |
+|---|---|---|---|---|---|
+| 27 | **Bootstrap sheets in Jayden's Drive get orphaned on every handover** | After each client claims, the old sheet is still in Jayden's Drive but no longer linked in `lp_sheet_configs` — clutter accumulates | By design — the new flow replaces the sheet pointer, doesn't delete the file | Manual: Jayden deletes them from Drive when he feels like it. A quarterly cleanup is fine | ⚠️ Manual housekeeping |
+| 28 | **No way to monitor OAuth callback errors post-hoc** | If a handover fails we have no way to see what went wrong from Claude's side | No Vercel logs API in Claude's MCP toolset | Manual: check Vercel logs in the dashboard if handover reports errors | ⚠️ Manual debugging |
+
+### Category 10 — Things that worked but could trip us next time
+
+| # | Hiccup | Symptom | Root cause | Fix commit | Automatic now? |
+|---|---|---|---|---|---|
+| 29 | **Yamaguchi's `handed_over_at` was NULL originally** | The new ?first URL would have been valid against a real production LP that already had admins | Backfill was required when adding `handed_over_at` to `lps` | Migration `20260409_lps_handover_and_domain` backfilled to `MIN(lp_admins.created_at)` for all non-cloq LPs at migration time. Cloq was intentionally left NULL for end-to-end testing | ✅ Migration-time fix; any NEW LP gets `handed_over_at=NULL` by default, which is the correct pre-handover state |
+| 30 | **Two cloq builds with different content** | Turn 1-3 had a minimal placeholder version; turn 4 replaced it with the real 2-position version | Initial build was too minimal; had to overwrite to reach yamaguchi quality | `lp_content_revisions` trigger automatically logged both versions. This is working as designed — always audit rev 1 vs rev 2 if something looks off | ✅ Automatic audit log |
+| 31 | **Slack OG preview cache locked in the bad preview** | First paste showed "日報シンクロくん"; second paste of the same URL still showed it even after the fix deployed | Slack caches link previews for ~30 min per URL; unfurls don't auto-refresh | Workaround: use Slack's OG debugger or add a cache-bust query param | ⚠️ Manual; mention to user on first paste |
+
+---
+
+## Troubleshooting — quick symptom → cause table
+
+If something goes wrong post-bootstrap, check this list before digging:
+
+| Symptom | Most likely cause | Fix |
+|---|---|---|
+| `/lp/{slug}/admin` returns "LPが見つかりません" | Step 10.3 skipped — `lp_admins` has no row | `INSERT INTO lp_admins` for Jayden (owner) + `.cs@gmail.com` (member) |
+| `/lp/{slug}/entry` dropdown shows wrong positions | You're hitting the legacy static HTML path somehow | Verify `src/app/lp/[slug]/entry/route.ts` exists; check that no `public/lp/{slug}/entry/index.html` exists |
+| Sheet sync stops working | `lp_admins.google_refresh_token` is NULL for the current owner | The owner needs to re-OAuth: visit `/lp/{slug}/admin` in an incognito window → click Google sign-in |
+| Link preview shows "日報シンクロくん" | OG cache in the unfurler (Slack/iMessage/LINE), not a server bug — check the actual HTML via curl first | Use Slack's OG debugger OR add `?first&v=2` to bust iMessage's cache. Verify server-side with `curl $URL \| grep og:title` |
+| "Vercel Active" pill is green but DNS isn't actually working | You're reading the wrong Vercel field (`/v9.verified` is misleading) | Use `/v6/domains/{domain}/config.configuredBy` instead. RULE 12. |
+| `?first` URL shows "引き渡し済みです" unexpectedly | `lps.handed_over_at` is set. Check who claimed and when | If genuine: no reset, use invite flow. If emergency: `UPDATE lps SET handed_over_at=NULL WHERE slug='...'` via Supabase MCP — document it explicitly |
+| Client can't sign in via Google on `?first` | Consent screen still in "testing" mode, and client isn't on the test user list | Publish the OAuth consent screen in Google Cloud Console (requires app verification for sensitive scopes; our scopes are all non-sensitive so it's instant) |
+| Custom domain attach returns 402 | Vercel Pro account quota exceeded (100 domains/project cap on Pro) | Upgrade plan or detach unused domains first |
+| Sheet sync fires but `last_sync_status='error'` | Usually an expired access token where refresh also failed | Owner re-OAuth; check `last_sync_error` field for the exact Google API message |
+
+---
+
+## Pre-flight check — run this BEFORE the next bootstrap
+
+Before building a NEW client LP, verify the environment is healthy:
+
+```sql
+-- 1. Jayden has fresh Google tokens (for step 10.5 sheet creation)
+select
+  (google_refresh_token is not null) as has_refresh,
+  google_token_expiry > now() as access_valid,
+  last_signed_in_at
+from public.lp_admins
+where email = 'jayden.barnes@mgc-global01.com'
+  and lp_slug = 'yamaguchi'  -- known-stable reference
+limit 1;
+
+-- 2. The lps master registry is reachable
+select count(*)::int as total_lps from public.lps;
+
+-- 3. Industry preset is loaded
+select industry, key from public.industry_presets limit 5;
+
+-- 4. Storage bucket exists
+-- (run via Supabase dashboard: Storage → lp-assets → should exist, public read)
+```
+
+Expected:
+- `has_refresh=true` and `access_valid=true` (or false + clear path for Jayden to re-OAuth)
+- `total_lps >= 2` (yamaguchi + cloq at minimum; more over time)
+- At least one `industry_presets` row exists (`製造業/default`)
+- `lp-assets` bucket is live
+
+**If step 1 fails**: Jayden visits `/lp/yamaguchi/admin` → "Googleアカウントでサインイン" → done. Takes 10 seconds. This ALSO makes step 10.5 of the bootstrap work without skipping.
+
+**If step 2-4 fail**: something is wrong with Supabase — do NOT proceed with the bootstrap until fixed.
 
 ---
 
@@ -287,29 +445,32 @@ For the FIRST run on a new site, Claude may want to step through manually to ver
 
 ```
 mgc-saiyo-lp-bootstrap/
-├── SKILL.md                       ← this file
+├── SKILL.md                       ← this file (workflow + rules + retrospective)
 ├── README.md                      ← human-facing overview
-├── references/
-│   ├── lp-content-schema.md       ← copy of LpContent type for offline reference
+├── references/                    ← design-time reference docs (not executed)
+│   ├── lp-content-schema.md       ← copy of LpContent type
 │   ├── content-extraction.md      ← multi-page crawl strategy + selectors
-│   ├── image-pipeline.md          ← detailed image strategy + nano-banana prompts
+│   ├── image-pipeline.md          ← image strategy + nano-banana prompts
 │   ├── ai-gap-fill.md             ← prompts for generating missing sections
 │   └── industry-presets.md        ← how to load + apply presets
 └── scripts/
     ├── bootstrap.py               ← orchestrator (entry point)
-    ├── crawl_reference.py         ← multi-page web_fetch crawler → ContentBundle
+    ├── crawl_reference.py         ← multi-page crawler → ContentBundle (with logo + dl extraction)
     ├── extract_design.py          ← Aura wrapper with CSS-fallback
-    ├── compose_lpcontent.py       ← merges ContentBundle + DesignTokens + preset → LpContent
-    ├── image_pipeline.py          ← runs the image strategy mix
-    └── upsert_lp.py               ← POST to /api/admin/lp-content-upsert
+    └── compose_lpcontent.py       ← merges ContentBundle + design tokens + preset → LpContent
 ```
+
+**NOT in the repo** (intentionally): no `upsert_lp.py` (we use Supabase MCP `execute_sql` directly from Claude), no `image_pipeline.py` (image enhancement is a follow-up manual step invoking nano-banana-proxy skill + unsplash-photos skill; hasn't been folded into this orchestrator yet).
 
 ---
 
 ## Out of scope (do NOT add to this skill)
 
-- Editing existing LPs (use `/lp/{slug}/admin`)
-- Custom domain mapping (separate `lp_domains` table, future work)
-- Multi-language LPs (current schema is JP-only)
-- Non-recruitment site types (would be a sibling skill: `mgc-corp-site-bootstrap`)
-- Direct image manipulation outside the strategy table (scraping logos, etc.)
+- **Editing existing LPs** — use the admin editor at `/lp/{slug}/admin`, not this skill
+- **Custom domain setup at bootstrap time** — the Vercel domain automation (RULE 12) is a POST-HANDOVER, owner-only flow in the dashboard. Even if the user tells you the client's domain during bootstrap, just note it in the polish checklist; don't try to attach it
+- **Running the actual `/admin?first` handover** — that's the client's action, not ours; we just return the URL
+- **Manual Jayden re-OAuth** — if `lp_admins.jayden.barnes@mgc-global01.com.google_refresh_token` is NULL at bootstrap time, step 10.5 skips sheet creation and logs it in provenance. Don't try to "fix" Jayden's OAuth from Claude — tell the user to visit `/lp/{any_slug}/admin` and click Google sign-in
+- **Multi-language LPs** — current `lp_content` schema is JP-only
+- **Non-recruitment site types** — would be a sibling skill: `mgc-corp-site-bootstrap`
+- **Deleting the orphaned bootstrap sheets** from Jayden's Drive after handover — those stay as files; Jayden cleans them up manually when he feels like it
+- **Resetting `lps.handed_over_at`** for an already-claimed LP — by design, one-shot. See RULE 11.
