@@ -14,6 +14,16 @@ the nippo-sync repo. The output is ready to insert into public.lp_content.
 Speed > polish: this fills every section so the LP renders cleanly on first
 load. Quality is "good enough to demo" — Jayden polishes in the admin editor.
 
+⚠️ AUDIENCE PIVOT LIMITATION
+This script does naive paragraph copying for hero/about/strengths content. If
+the source site is a B2B service business (consulting, agency, SaaS, etc.),
+the homepage paragraphs are targeted at CLIENTS, not job seekers, and copying
+them verbatim produces a 採用LP with the wrong 対象. The skill orchestrator
+(Claude in the calling conversation) is responsible for reviewing the composed
+hero / about / strengths sections and rewriting them with a job-seeker frame
+BEFORE inserting the lp_content into Supabase. The provenance flag
+`audience_pivot_review_needed: true` is set on every output as a reminder.
+
 Usage:
     cat input.json | python3 compose_lpcontent.py
 
@@ -101,6 +111,74 @@ def truncate(s: str, max_chars: int, suffix: str = "…") -> str:
     if len(s) <= max_chars:
         return s
     return s[: max_chars - len(suffix)].rstrip() + suffix
+
+
+def dl_lookup(pairs: list[dict], keywords: list[str]) -> str | None:
+    """Find a dl pair whose term contains any of the given keywords.
+
+    Used to pull specific values out of bundle.company_info or
+    bundle.job_details (the structured <dl> data extracted from
+    会社概要 / 募集要項 sections by crawl_reference.py).
+    """
+    if not pairs:
+        return None
+    for p in pairs:
+        term = p.get("term", "")
+        if any(kw in term for kw in keywords):
+            return p.get("description")
+    return None
+
+
+def dl_to_welfare_items(job_details: list[dict]) -> list[dict]:
+    """Convert relevant 募集要項 dl pairs into welfare display items.
+
+    Maps the standard 募集要項 keys to (term, description) pairs that
+    fit the welfare section's schema. Skips operational keys like
+    勤務地 / 業務内容 / 求める人物像 that belong elsewhere.
+    """
+    if not job_details:
+        return []
+    welfare_keywords = (
+        "給与", "賞与", "昇給", "手当",
+        "勤務時間", "残業",
+        "休日", "休暇", "有給",
+        "保険", "福利厚生", "待遇", "制度", "退職金",
+    )
+    skip_keywords = ("業務内容", "勤務地", "求める", "応募", "選考", "問い合わせ")
+    out: list[dict] = []
+    seen_terms: set[str] = set()
+    for p in job_details:
+        term = (p.get("term") or "").strip()
+        if not term or term in seen_terms:
+            continue
+        if any(s in term for s in skip_keywords):
+            continue
+        if not any(k in term for k in welfare_keywords):
+            continue
+        seen_terms.add(term)
+        out.append({"term": term, "description": p.get("description", "")})
+    return out
+
+
+def dl_to_requirements(job_details: list[dict]) -> list[dict]:
+    """Convert all 募集要項 dl pairs into the JobDetail.requirements shape.
+
+    Unlike dl_to_welfare_items, this keeps everything (業務内容, 勤務地,
+    求める人物像, etc.) so the dedicated /lp/{slug}/jobs/{n} detail page
+    has the complete 募集要項 table.
+    """
+    if not job_details:
+        return []
+    skip = ("お問い合わせ",)
+    out: list[dict] = []
+    for p in job_details:
+        term = (p.get("term") or "").strip()
+        if not term:
+            continue
+        if any(s in term for s in skip):
+            continue
+        out.append({"term": term, "description": p.get("description", "")})
+    return out
 
 
 def first_image(bundle: dict, exclude_urls: set[str] | None = None) -> str:
@@ -310,20 +388,109 @@ def compose_voices(bundle: dict) -> dict:
 
 
 def compose_openings(bundle: dict, company_name: str) -> dict:
-    raw_jobs = bundle.get("existing_jobs") or []
-    real_jobs = [j for j in raw_jobs if looks_like_real_job(j.get("title", ""))]
+    """Build openings.items, preferring the structured 募集要項 dl when present.
 
+    Three sources, in priority order:
+      1. bundle.job_details — full 募集要項 from /recruit/ as a single rich
+         item with detail.requirements populated. THIS IS THE GOOD PATH.
+      2. bundle.existing_jobs — heading-based scrape (often noisy on
+         consultancy / service-business sites). Filtered through
+         looks_like_real_job().
+      3. Single placeholder 総合職 so the LP isn't blank.
+    """
+    job_details = bundle.get("job_details") or []
     items: list[dict] = []
-    for i, job in enumerate(real_jobs[:6]):
+
+    # Path 1: structured 募集要項 dl
+    if job_details:
+        # Title comes from the 業務内容 / 職種 / ポジション field
+        title = (
+            dl_lookup(job_details, ["業務内容", "職種", "ポジション", "募集職種"])
+            or "募集職種"
+        )
+        # Clean the title: 業務内容 is often a phrase like
+        # "法人様の採用設計・採用支援スタッフ" — split on the separator and
+        # take whichever part actually looks like a role name (ends in
+        # スタッフ / 担当 / マネージャー / エンジニア / 職 / etc.). If neither
+        # part looks role-like, take the LAST part as that's where job titles
+        # usually live in JP descriptions ("X の Y 担当").
+        ROLE_SUFFIXES = ("スタッフ", "担当", "マネージャー", "リーダー", "エンジニア",
+                          "デザイナー", "オペレーター", "アシスタント", "ディレクター",
+                          "プランナー", "コンサルタント", "職")
+        for sep in ("／", "/", "・", "、"):
+            if sep in title:
+                parts = [p.strip() for p in title.split(sep) if p.strip()]
+                # Prefer parts ending in a role suffix
+                role_parts = [p for p in parts if any(p.endswith(s) for s in ROLE_SUFFIXES)]
+                if role_parts:
+                    title = role_parts[-1]
+                else:
+                    title = parts[-1]
+                break
+        title = truncate(title, 30, suffix="")
+        # Employment type comes from 雇用形態
+        badge = dl_lookup(job_details, ["雇用形態"]) or "正社員"
+        if len(badge) > 10:
+            badge = "正社員"
+        # Card description: pitch the role using whatever extra context the
+        # 募集要項 provided. Avoid duplicating the (now-cleaned) title.
+        biz_desc = dl_lookup(job_details, ["業務内容"]) or ""
+        if biz_desc and biz_desc != title:
+            description = f"{biz_desc}。{company_name}で一緒に働く仲間を募集しています。"
+        else:
+            description = f"{company_name}で活躍する{title}を募集しています。詳細は募集要項をご覧ください。"
+        description = truncate(description, 180)
+
+        # Detail page: full 募集要項 table + 3 quick highlight points
+        requirements = dl_to_requirements(job_details)
+        points: list[dict] = []
+        person_spec = dl_lookup(job_details, ["求める人物像", "求める人材"])
+        if person_spec:
+            # Split on standard list separators first, then fall back to
+            # phrase-boundary words like 「方」 which JP recruit pages use to
+            # delimit individual desired traits ("X な方  Y な方  Z な方").
+            parts: list[str] = []
+            for sep in ("／", "/", "、", "・"):
+                if sep in person_spec:
+                    parts = [p.strip() for p in person_spec.split(sep) if p.strip()]
+                    break
+            if not parts and "方" in person_spec:
+                # Split after each 「方」 keeping the word
+                import re as _re
+                parts = [p.strip() for p in _re.split(r"(?<=方)\s+", person_spec) if p.strip()]
+            if not parts:
+                parts = [person_spec]
+            points = [{"title": truncate(p, 40, suffix="")} for p in parts[:3]]
+
         items.append({
-            "image": pick_image(bundle, 3 + i) or pick_image(bundle, 0),
-            "badge": "正社員",
-            "title": job["title"],
-            "description": f"{company_name}で活躍する{job['title']}を募集しています。詳細はお問い合わせください。",
+            "image": pick_image(bundle, 3) or pick_image(bundle, 0),
+            "badge": badge,
+            "title": title,
+            "description": description,
+            "detail": {
+                "en_title": "RECRUITMENT",
+                "tagline": dl_lookup(job_details, ["業務内容"]) or title,
+                "intro": f"{company_name}で募集中のポジションです。詳細は以下の募集要項をご確認ください。",
+                "hero_bg": pick_image(bundle, 3) or pick_image(bundle, 0),
+                "points": points,
+                "requirements": requirements,
+            },
         })
 
+    # Path 2: noisy heading-scrape fallback
     if not items:
-        # Fallback: 1 generic position so the LP isn't blank
+        raw_jobs = bundle.get("existing_jobs") or []
+        real_jobs = [j for j in raw_jobs if looks_like_real_job(j.get("title", ""))]
+        for i, job in enumerate(real_jobs[:6]):
+            items.append({
+                "image": pick_image(bundle, 3 + i) or pick_image(bundle, 0),
+                "badge": "正社員",
+                "title": job["title"],
+                "description": f"{company_name}で活躍する{job['title']}を募集しています。詳細はお問い合わせください。",
+            })
+
+    # Path 3: blank-LP fallback
+    if not items:
         items.append({
             "image": pick_image(bundle, 3) or pick_image(bundle, 0),
             "badge": "正社員",
@@ -334,7 +501,21 @@ def compose_openings(bundle: dict, company_name: str) -> dict:
     return {"sub": "現在募集中のポジション", "items": items}
 
 
-def compose_welfare(preset: dict) -> dict:
+def compose_welfare(preset: dict, bundle: dict | None = None) -> dict:
+    """Welfare prefers real scraped 募集要項 entries over preset defaults.
+
+    The 募集要項 on a /recruit/ page usually contains the actual 給与 /
+    休日 / 保険 / 福利厚生 values for the position — using those means
+    the LP shows the company's REAL terms, not generic placeholders.
+    """
+    bundle = bundle or {}
+    scraped = dl_to_welfare_items(bundle.get("job_details") or [])
+
+    if scraped:
+        # Real welfare data from the recruit page — use it as the primary source
+        return {"sub": "待遇・福利厚生", "items": scraped}
+
+    # Fall back to industry preset
     items = (preset or {}).get("welfare_items") or [
         {"term": "給与", "description": "経験・スキルに応じて優遇"},
         {"term": "賞与", "description": "年2回（6月・12月）"},
@@ -353,17 +534,31 @@ def compose_cta(company_name: str) -> dict:
 
 
 def compose_footer(bundle: dict, company_name: str) -> dict:
+    """Footer pulls structured fields from the 会社概要 dl when available,
+    falling back to free-text business_descriptions for the business field."""
     address = bundle.get("address") or ""
-    biz = bundle.get("business_descriptions") or []
-    business_summary = truncate(biz[0], 80) if biz else ""
+
+    # Founded date — from 設立 / 創業 keys in 会社概要
+    founded = bundle.get("founded") or ""
+
+    # Representative — from 代表者 / 代表取締役 keys in 会社概要
+    representative = bundle.get("representative") or ""
+
+    # Business summary — prefer the structured 主な事業内容 dl value, fall
+    # back to the first free-text business description, then truncate.
+    business = bundle.get("business_type") or ""
+    if not business:
+        biz = bundle.get("business_descriptions") or []
+        business = biz[0] if biz else ""
+    business = truncate(business, 120)
 
     return {
         "company_name": company_name,
         "tagline": "",
         "address": address,
-        "founded": "",
-        "representative": "",
-        "business": business_summary,
+        "founded": founded,
+        "representative": representative,
+        "business": business,
     }
 
 
@@ -408,7 +603,7 @@ def main() -> int:
         "data": compose_data(preset, client_name),
         "voices": compose_voices(bundle),
         "openings": compose_openings(bundle, client_name),
-        "welfare": compose_welfare(preset),
+        "welfare": compose_welfare(preset, bundle),
         "cta": compose_cta(client_name),
         "map_embed_src": "",
         "footer": compose_footer(bundle, client_name),
@@ -416,17 +611,33 @@ def main() -> int:
     }
 
     # Provenance: track which fields came from where for the orchestrator's report
+    has_company_dl = bool(bundle.get("company_info"))
+    has_job_dl = bool(bundle.get("job_details"))
     provenance = {
         "company_name": "scraped" if bundle.get("company_name") else "fallback",
         "address": "scraped" if bundle.get("address") else "missing",
         "tel": "scraped" if bundle.get("tel") else "missing",
+        "founded": "scraped_dl" if bundle.get("founded") else "missing",
+        "representative": "scraped_dl" if bundle.get("representative") else "missing",
+        "business_type": "scraped_dl" if bundle.get("business_type") else (
+            "scraped_text" if bundle.get("business_descriptions") else "missing"
+        ),
         "rep_message": "scraped" if bundle.get("representative_message") else "missing",
-        "openings": "scraped" if bundle.get("existing_jobs") else "fallback_generic",
-        "welfare": "preset" if preset.get("welfare_items") else "default",
+        "openings": (
+            "scraped_dl_full" if has_job_dl
+            else "scraped_headings" if bundle.get("existing_jobs")
+            else "fallback_generic"
+        ),
+        "welfare": (
+            "scraped_dl" if has_job_dl
+            else "preset" if preset.get("welfare_items")
+            else "default"
+        ),
         "data": "preset" if preset.get("data_pills") else "default",
         "theme_colors": (design_tokens or {}).get("source", "default"),
         "voices": "placeholder_v0",
         "map_embed_src": "empty_v0",
+        "audience_pivot_review_needed": True,  # see note below
     }
 
     output = {

@@ -283,6 +283,52 @@ def is_business_page(url: str) -> bool:
     return any(p in url.lower() for p in ("/business", "/service"))
 
 
+
+def collect_dl_pairs(soup: BeautifulSoup) -> list[dict]:
+    """Extract <dl><dt>key</dt><dd>value</dd></dl> structures.
+
+    Japanese corporate sites overwhelmingly use definition lists for
+    会社概要 (company info) and 募集要項 (job requirements). Returns a flat
+    list of {term, description} dicts. Multiple <dd>s per <dt> get joined
+    with " / " — common for things like 福利厚生 lists.
+
+    Walks dt/dd in document order regardless of intermediate wrapper
+    elements (e.g. cloq.jp wraps each pair in a <div>, so direct children
+    iteration would miss everything).
+    """
+    out: list[dict] = []
+    for dl in soup.find_all("dl"):
+        elements = dl.find_all(["dt", "dd"])
+        i = 0
+        while i < len(elements):
+            if elements[i].name == "dt":
+                term = elements[i].get_text(separator=" ", strip=True)
+                values: list[str] = []
+                j = i + 1
+                while j < len(elements) and elements[j].name == "dd":
+                    v = elements[j].get_text(separator=" ", strip=True)
+                    if v:
+                        values.append(v)
+                    j += 1
+                if term and values:
+                    out.append({
+                        "term": term,
+                        "description": " / ".join(values),
+                    })
+                i = j
+            else:
+                i += 1
+    return out
+
+
+def find_dl_value(pairs: list[dict], keywords: list[str]) -> Optional[str]:
+    """Find a dl term containing any keyword and return its description."""
+    for p in pairs:
+        if any(kw in p["term"] for kw in keywords):
+            return p["description"]
+    return None
+
+
 # ─── Main ─────────────────────────────────────────────────────────────────
 
 def main() -> int:
@@ -326,6 +372,21 @@ def main() -> int:
     all_text = "\n".join(soup.get_text(separator=" ", strip=True) for _, soup, _ in pages)
 
     # Build the content bundle
+    # Collect <dl> pairs from each page, tagged by page type for downstream use
+    dl_company_info: list[dict] = []   # 会社概要 from /about/
+    dl_job_details: list[dict] = []    # 募集要項 from /recruit/
+    dl_other: list[dict] = []
+    for url, soup, _ in pages:
+        pairs = collect_dl_pairs(soup)
+        if not pairs:
+            continue
+        if "/about" in url.lower() or "/company" in url.lower() or "/profile" in url.lower():
+            dl_company_info.extend(pairs)
+        elif is_recruit_page(url):
+            dl_job_details.extend(pairs)
+        else:
+            dl_other.extend(pairs)
+
     bundle: dict = {
         "source_url": home_url,
         "pages_fetched": [u for u, _, _ in pages],
@@ -339,6 +400,15 @@ def main() -> int:
         "existing_news": extract_news_items(home_soup),
         "paragraph_pool": [],
         "image_pool": [],
+        # New structured fields from <dl> extraction
+        "company_info": dl_company_info,   # all 会社概要 dl pairs
+        "job_details": dl_job_details,     # all 募集要項 dl pairs
+        "other_dl_pairs": dl_other,
+        # Convenience extracted fields
+        "founded": find_dl_value(dl_company_info, ["設立", "創業"]),
+        "representative": find_dl_value(dl_company_info, ["代表者", "代表取締役"]),
+        "capital": find_dl_value(dl_company_info, ["資本金"]),
+        "business_type": find_dl_value(dl_company_info, ["事業内容", "業務内容", "主な事業"]),
     }
 
     # Extract representative message — prefer dedicated /message page, fall back to home
@@ -400,6 +470,10 @@ def main() -> int:
         f"Bundle: company={bundle['company_name']!r}, "
         f"address={'yes' if bundle['address'] else 'no'}, "
         f"tel={'yes' if bundle['tel'] else 'no'}, "
+        f"founded={bundle['founded']!r}, "
+        f"representative={bundle['representative']!r}, "
+        f"company_info_pairs={len(bundle['company_info'])}, "
+        f"job_detail_pairs={len(bundle['job_details'])}, "
         f"message={'yes' if bundle['representative_message'] else 'no'}, "
         f"business_paras={len(bundle['business_descriptions'])}, "
         f"jobs={len(bundle['existing_jobs'])}, "

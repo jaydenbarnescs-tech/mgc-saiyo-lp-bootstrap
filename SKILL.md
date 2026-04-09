@@ -87,26 +87,50 @@ The skill orchestrator is `scripts/bootstrap.py` on the VM at `/home/ubuntu/mgc-
    - Extract `<img>` srcs
    - Extract Open Graph image
    - Extract favicon
-8. **Compose LpContent** (`compose_lpcontent.py`):
-   - **Visual** (`theme`, font hints) ← Aura or CSS fallback
-   - **meta.title**, **header.company_name**, **header.logo_letter** ← ContentBundle.company_name
-   - **hero.subtext** + **hero.jp_tagline** ← AI-generated from ContentBundle paragraphs (recruitment tone)
-   - **hero.en_title** ← preset's `hero_en_titles[0]` or AI-generated single English word
-   - **hero.bg_image** ← filled by Phase 9
-   - **about.headline** + **about.paragraphs** ← lightly rewrite ContentBundle.representative_message + business_descriptions
-   - **strengths.items** ← parse 3 value props from ContentBundle, or AI-generate from business_descriptions
-   - **data.items** ← industry preset (placeholder numbers, flagged for user edit)
-   - **voices.items** ← industry preset employee voices, photos filled by Phase 9
-   - **openings.items** ← ContentBundle.existing_jobs if found, otherwise industry preset job_templates
-   - **welfare.items** ← industry preset welfare_items
-   - **cta** + **footer** ← ContentBundle.address/tel + AI-generated CTA copy
-   - **theme** ← Aura colors
+8. **Compose LpContent draft** (`compose_lpcontent.py`) — produces a structural draft, NOT the final content:
+
+   **Fields the composer fills correctly without review** (use as-is):
+   - `meta.title`, `header.company_name`, `header.logo_letter` ← ContentBundle.company_name
+   - `theme.primary/accent/accent2` ← Aura or CSS fallback (from extract_design.py)
+   - `footer.address` ← scraped via 〒 regex
+   - `footer.founded` ← bundle.founded (extracted from 設立 / 創業 in 会社概要 dl)
+   - `footer.representative` ← bundle.representative (extracted from 代表者 / 代表取締役 in 会社概要 dl)
+   - `footer.business` ← bundle.business_type (主な事業内容 in 会社概要 dl)
+   - `welfare.items` ← bundle.job_details when 募集要項 dl is present (real welfare items, not preset defaults)
+   - `openings.items[0]` + `.detail.requirements` ← bundle.job_details when 募集要項 dl is present (real role + 8-line 募集要項 table)
+
+   **Fields that need Claude review BEFORE insert** (see step 8.5 — audience pivot):
+   - `hero.jp_tagline`, `hero.subtext`
+   - `about.headline`, `about.paragraphs`
+   - `strengths.items` (especially the title + body of each)
+   - `cta.headline`, `cta.sub`
+
+   **Fields with placeholders** (flagged for user polish in admin editor):
+   - `voices.items` ← single placeholder; real photos via follow-up nano-banana step
+   - `data.items` ← industry preset defaults
+   - `map_embed_src` ← empty
+
+8.5. **Audience pivot review** — THIS IS THE STEP YOU CANNOT SKIP. Read the composer output and rewrite the audience-sensitive sections (hero, about, strengths, cta) BEFORE inserting into Supabase. See RULE 9 for the full rationale, but the short version:
+
+   The composer naively copies paragraphs from the source site into hero/about/strengths. If the source is a B2B service business (consulting firm, agency, SaaS company), those paragraphs are pitching services to **CLIENTS**, not pitching the company as an employer to **JOB SEEKERS**. Verbatim copying produces a 採用LP with the wrong 対象 — the strengths section reads like sales copy.
+
+   Claude's job at this step:
+   1. Read ContentBundle.business_descriptions, .representative_message, and .paragraph_pool to understand what the company DOES and what they VALUE.
+   2. Read bundle.job_details for the 求める人物像 + 福利厚生 → these are the real job-seeker hooks.
+   3. Rewrite hero.jp_tagline, hero.subtext, about.headline, about.paragraphs, strengths.items, cta.* to be from a job-seeker's perspective: "what you'll learn here", "what this team values", "how this company works", "what's in it for you". NOT "what we sell to clients".
+   4. Set provenance.audience_pivot_review_needed = false in the final payload.
 9. **Image pipeline** — see image strategy table below
 10. **Insert via Supabase MCP** (single transaction preferred) — use `Supabase:execute_sql` against project `pglaffdnhixmabcjdxbi`:
     1. `INSERT INTO public.lps` if not already done in step 3
-    2. `INSERT INTO public.lp_content (lp_slug, content, published) VALUES (...)` with the composed LpContent as a `$LPCONTENT$...$LPCONTENT$::jsonb` dollar-quoted literal (avoids escaping the Japanese + nested quotes mess)
+    2. `INSERT INTO public.lp_content (lp_slug, content, published) VALUES (...)` with the AUDIENCE-REVIEWED LpContent as a `$LPCONTENT$...$LPCONTENT$::jsonb` dollar-quoted literal (avoids escaping the Japanese + nested quotes mess)
     3. `INSERT INTO public.lp_admins (lp_slug, email, role)` for `jayden.barnes@mgc-global01.com` as `owner` AND `jayden.barnes.cs@gmail.com` as `member`. Without this row the `/lp/{slug}/admin` page treats the LP as nonexistent (the `fetchCompanyAndExists` function checks lp_admins as one of the existence signals).
     4. `UPDATE public.lps SET status = 'live' WHERE slug = '{slug}'`
+
+10.5. **Create Google Sheet for entries auto-sync** — read Jayden's existing Google OAuth tokens from `lp_admins` (he's already authorized for nippo-sync overall, so the tokens carry over to new slugs):
+    1. Fetch `google_access_token` for `jayden.barnes@mgc-global01.com`. If `google_token_expiry` < now, refresh it via `https://oauth2.googleapis.com/token` using `GOOGLE_CLIENT_ID` + `GOOGLE_CLIENT_SECRET` from Doppler (`nippo-syncro-kun/dev`) plus the stored refresh_token.
+    2. POST to `https://sheets.googleapis.com/v4/spreadsheets` with `{"properties": {"title": "{client_name} - 採用エントリー", "locale": "ja_JP", "timeZone": "Asia/Tokyo"}, "sheets": [{"properties": {"title": "Entries"}}]}`. The sheet lands in jayden.barnes@mgc-global01.com's Drive.
+    3. PUT the LP_ENTRY_HEADERS row to `/spreadsheets/{id}/values/Entries!A1?valueInputOption=USER_ENTERED`. Headers: `["ID","応募日時","LP Slug","会社名","お名前","メール","電話","職種","志望動機","ステータス","内部メモ","Source"]`
+    4. INSERT into `public.lp_sheet_configs` with `connection_type='oauth'`, `auto_sync=true`, `worksheet_name='Entries'`, `last_sync_status='success'`, `last_synced_count=0`. After this, every form submission to `/api/lp-entry` will auto-append to the sheet via the existing handler logic.
 11. **Verify** — GET `https://nippo-sync.vercel.app/lp/{slug}`, confirm 200 + content renders
 12. **Verify the admin entrypoint** — GET `https://nippo-sync.vercel.app/lp/{slug}/admin`, confirm it returns the ConnectScreen (sign-in prompt) and NOT the "LPが見つかりません" 404 screen. If the latter, the lp_admins insert in step 10.3 was skipped — go back and insert it.
 13. **Hand off** — return to user:
@@ -144,7 +168,9 @@ The skill orchestrator is `scripts/bootstrap.py` on the VM at `/home/ubuntu/mgc-
 
 **RULE 5 — Every AI-generated field is logged** in the provenance report. User must always know what's hallucinated and what's real.
 
-**RULE 6 — All images go through lp-assets bucket.** Never reference an external URL (proxy server, original site, Unsplash CDN) directly in lp_content. We own our assets.
+**RULE 6 — Images SHOULD go through lp-assets bucket (v1 goal).** The long-term target is that every image in `lp_content` is hosted on the `lp-assets` Supabase Storage bucket so we own our assets. For v0, raw scraped URLs from the client's site are acceptable as long as they're flagged in provenance — image migration runs as a follow-up step after the LP is verified live.
+
+**RULE 9 — Audience pivot is mandatory before insert.** The composer is a structural draft, not the final content. Whenever the source site is a B2B service business (consulting, agency, SaaS, anything that sells *to other businesses*), its homepage paragraphs are pitching services to *clients*, NOT recruiting *job seekers*. Verbatim copying produces sales copy in the strengths section instead of employer branding. Claude MUST review and rewrite hero/about/strengths/cta from a job-seeker frame at workflow step 8.5 BEFORE the Supabase insert. The composer always sets `provenance.audience_pivot_review_needed: true` as a reminder — Claude flips it to false only after rewriting. The cloq pivot is the canonical example: client-facing "we deeply understand your hiring problem, we PDCA your funnel" was rewritten as candidate-facing "you'll get hands-on実務スキル, work in a flat 本音-driven team, in a 在宅可・服装自由 environment".
 
 **RULE 7 — Industry preset auto-update is OPT-IN.** After polishing, the system suggests "save these as the new {industry} default preset?" but never auto-saves.
 
@@ -153,6 +179,8 @@ The skill orchestrator is `scripts/bootstrap.py` on the VM at `/home/ubuntu/mgc-
 ---
 
 ## Verification gate (skill is "done" when these all pass)
+
+- [ ] `provenance.audience_pivot_review_needed` is `false` in the final payload (i.e. Claude actually did step 8.5)
 
 - [ ] Skill triggers on the example phrases
 - [ ] cloq.jp end-to-end produces a live LP at `/lp/cloq` within 2 minutes
