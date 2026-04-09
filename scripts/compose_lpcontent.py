@@ -226,11 +226,23 @@ def compose_meta(bundle: dict, company_name: str) -> dict:
     }
 
 
-def compose_header(company_name: str) -> dict:
-    return {
+def compose_header(bundle: dict, company_name: str) -> dict:
+    """Header: company name + logo_letter fallback + optional logo_image.
+
+    If the crawler extracted a real logo image from the source site
+    (via extract_logo() — WordPress custom-logo class, brand link
+    patterns, header <img> alt match, or favicon fallback), include it
+    as header.logo_image. The renderer prefers logo_image over the
+    letter fallback, rendering the actual company logo in the header.
+    """
+    header = {
         "company_name": company_name,
         "logo_letter": derive_logo_letter(company_name),
     }
+    logo_url = bundle.get("logo_url")
+    if logo_url:
+        header["logo_image"] = logo_url
+    return header
 
 
 def compose_hero(bundle: dict, design_tokens: dict, preset: dict, company_name: str) -> dict:
@@ -596,7 +608,7 @@ def main() -> int:
 
     lp_content: dict[str, Any] = {
         "meta": compose_meta(bundle, client_name),
-        "header": compose_header(client_name),
+        "header": compose_header(bundle, client_name),
         "hero": compose_hero(bundle, design_tokens, preset, client_name),
         "about": compose_about(bundle, client_name, used_images),
         "strengths": compose_strengths(bundle),
@@ -634,6 +646,9 @@ def main() -> int:
             else "default"
         ),
         "data": "preset" if preset.get("data_pills") else "default",
+        "logo": (
+            "scraped" if bundle.get("logo_url") else "fallback_letter"
+        ),
         "theme_colors": (design_tokens or {}).get("source", "default"),
         "voices": "placeholder_v0",
         "map_embed_src": "empty_v0",

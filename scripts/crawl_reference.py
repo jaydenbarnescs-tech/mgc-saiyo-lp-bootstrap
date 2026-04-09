@@ -331,6 +331,137 @@ def find_dl_value(pairs: list[dict], keywords: list[str]) -> Optional[str]:
 
 # ─── Main ─────────────────────────────────────────────────────────────────
 
+def extract_logo(soup: BeautifulSoup, page_url: str, company_name: str | None = None) -> Optional[str]:
+    """Extract the most likely company logo URL from a homepage.
+
+    Strategies in priority order (works on WordPress, custom sites, etc.):
+      1. <img class="custom-logo">      — WordPress theme standard
+      2. <a class="*logo*"> <img>       — common brand-link pattern
+      3. <img class="*logo*">           — generic logo class
+      4. <img alt="{company_name}"> in <header>
+      5. <img src contains "logo">
+      6. <link rel="icon" sizes="192x192">  — largest favicon as fallback
+      7. <link rel="apple-touch-icon">      — final fallback
+
+    Returns the ABSOLUTE URL of the logo, or None if nothing matched.
+    Favicon fallbacks are only returned if no <img> logo was found,
+    and are flagged in the caller's metadata as a fallback source.
+    """
+    def absolute(src: str) -> str:
+        if not src:
+            return ""
+        if src.startswith("//"):
+            return "https:" + src
+        if src.startswith("/"):
+            return urllib.parse.urljoin(page_url, src)
+        if src.startswith(("http://", "https://")):
+            return src
+        return urllib.parse.urljoin(page_url, src)
+
+    # Strategy 1: WordPress custom-logo class
+    img = soup.find("img", class_="custom-logo")
+    if img and img.get("src"):
+        return absolute(img["src"])
+
+    # Strategy 2: <a class="*logo*"> <img>
+    for a in soup.find_all("a"):
+        cls = " ".join(a.get("class") or []).lower()
+        if "logo" in cls or "brand" in cls or "site-title" in cls:
+            img = a.find("img")
+            if img and img.get("src"):
+                return absolute(img["src"])
+
+    # Strategy 3: generic logo class on <img>
+    for img in soup.find_all("img"):
+        cls = " ".join(img.get("class") or []).lower()
+        if "logo" in cls and "icon" not in cls:
+            if img.get("src"):
+                return absolute(img["src"])
+
+    # Strategy 4: alt text matches company name, inside <header>
+    if company_name:
+        hdr = soup.find("header")
+        if hdr:
+            for img in hdr.find_all("img"):
+                alt = (img.get("alt") or "").strip()
+                # Match on either exact or substring (株式会社 prefix/suffix tolerance)
+                if alt and (alt == company_name or alt in company_name or company_name in alt):
+                    if img.get("src"):
+                        return absolute(img["src"])
+
+    # Strategy 5: src contains "logo" (outside the general image pool filter)
+    for img in soup.find_all("img"):
+        src = (img.get("src") or "").lower()
+        # Avoid favicon/cropped/thumbnail variants
+        if "logo" in src and not any(x in src for x in ("favicon", "cropped-", "-32x32", "-16x16")):
+            return absolute(img["src"])
+
+    # Strategy 6/7: Favicon fallbacks (ordered by size preference)
+    favicon_candidates: list[tuple[int, str]] = []
+    for link in soup.find_all("link"):
+        rel = link.get("rel") or []
+        if not rel:
+            continue
+        rel_str = " ".join(rel).lower()
+        if "icon" in rel_str:
+            href = link.get("href")
+            if not href:
+                continue
+            sizes = link.get("sizes", "")
+            try:
+                size = int(sizes.split("x")[0]) if "x" in sizes else 0
+            except ValueError:
+                size = 0
+            # apple-touch-icon is usually 180px
+            if "apple-touch" in rel_str and size == 0:
+                size = 180
+            favicon_candidates.append((size, absolute(href)))
+
+    if favicon_candidates:
+        favicon_candidates.sort(reverse=True)
+        return favicon_candidates[0][1]
+
+    return None
+
+
+def extract_favicon(soup: BeautifulSoup, page_url: str) -> Optional[str]:
+    """Extract the site favicon separately from the logo. Returns the
+    highest-resolution icon URL available, or None."""
+    def absolute(src: str) -> str:
+        if not src:
+            return ""
+        if src.startswith("//"):
+            return "https:" + src
+        if src.startswith("/"):
+            return urllib.parse.urljoin(page_url, src)
+        if src.startswith(("http://", "https://")):
+            return src
+        return urllib.parse.urljoin(page_url, src)
+
+    candidates: list[tuple[int, str]] = []
+    for link in soup.find_all("link"):
+        rel = link.get("rel") or []
+        rel_str = " ".join(rel).lower()
+        if "icon" not in rel_str:
+            continue
+        href = link.get("href")
+        if not href:
+            continue
+        sizes = link.get("sizes", "")
+        try:
+            size = int(sizes.split("x")[0]) if "x" in sizes else 0
+        except ValueError:
+            size = 0
+        if "apple-touch" in rel_str and size == 0:
+            size = 180
+        candidates.append((size, absolute(href)))
+
+    if candidates:
+        candidates.sort(reverse=True)
+        return candidates[0][1]
+    return None
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Multi-page reference scraper.")
     parser.add_argument("url", help="Homepage URL to crawl.")
@@ -409,7 +540,13 @@ def main() -> int:
         "representative": find_dl_value(dl_company_info, ["代表者", "代表取締役"]),
         "capital": find_dl_value(dl_company_info, ["資本金"]),
         "business_type": find_dl_value(dl_company_info, ["事業内容", "業務内容", "主な事業"]),
+        # Visual identity — logo and favicon extracted from homepage <img> + <link>
+        "logo_url": extract_logo(home_soup, home_url, None),  # filled with company_name below
+        "favicon_url": extract_favicon(home_soup, home_url),
     }
+    # Re-run logo extraction with company_name hint (strategy 4 uses alt-text matching)
+    if not bundle["logo_url"]:
+        bundle["logo_url"] = extract_logo(home_soup, home_url, bundle["company_name"])
 
     # Extract representative message — prefer dedicated /message page, fall back to home
     for url, soup, _ in pages:
@@ -470,6 +607,7 @@ def main() -> int:
         f"Bundle: company={bundle['company_name']!r}, "
         f"address={'yes' if bundle['address'] else 'no'}, "
         f"tel={'yes' if bundle['tel'] else 'no'}, "
+        f"logo={'yes' if bundle['logo_url'] else 'no'}, "
         f"founded={bundle['founded']!r}, "
         f"representative={bundle['representative']!r}, "
         f"company_info_pairs={len(bundle['company_info'])}, "

@@ -86,11 +86,20 @@ The skill orchestrator is `scripts/bootstrap.py` on the VM at `/home/ubuntu/mgc-
    - Parse `<style>` tags + external CSS for the most common color values
    - Extract `<img>` srcs
    - Extract Open Graph image
-   - Extract favicon
+   - Extract favicon (bundle.favicon_url via extract_favicon())
+   - Extract company logo (bundle.logo_url via extract_logo()) — strategies in priority order:
+     1. `<img class="custom-logo">` — WordPress theme standard
+     2. `<a class="*logo*|brand|site-title"> <img>` — brand link pattern
+     3. `<img class="*logo*">` — generic logo class
+     4. `<img alt="{company_name}">` inside `<header>` — alt-text match
+     5. `<img src="*logo*">` — src pattern match (excluding favicon variants)
+     6. highest-resolution `<link rel="icon">` — favicon fallback
+     7. `<link rel="apple-touch-icon">` — final fallback
 8. **Compose LpContent draft** (`compose_lpcontent.py`) — produces a structural draft, NOT the final content:
 
    **Fields the composer fills correctly without review** (use as-is):
    - `meta.title`, `header.company_name`, `header.logo_letter` ← ContentBundle.company_name
+   - `header.logo_image` ← bundle.logo_url (real company logo extracted by `extract_logo()` — WordPress custom-logo class, brand-link <img>, header <img> with matching alt, favicon fallback). When present, the renderer shows the actual logo image in the header; `logo_letter` remains as a graceful fallback
    - `theme.primary/accent/accent2` ← Aura or CSS fallback (from extract_design.py)
    - `footer.address` ← scraped via 〒 regex
    - `footer.founded` ← bundle.founded (extracted from 設立 / 創業 in 会社概要 dl)
@@ -133,10 +142,20 @@ The skill orchestrator is `scripts/bootstrap.py` on the VM at `/home/ubuntu/mgc-
     4. INSERT into `public.lp_sheet_configs` with `connection_type='oauth'`, `auto_sync=true`, `worksheet_name='Entries'`, `last_sync_status='success'`, `last_synced_count=0`. After this, every form submission to `/api/lp-entry` will auto-append to the sheet via the existing handler logic.
 11. **Verify** — GET `https://nippo-sync.vercel.app/lp/{slug}`, confirm 200 + content renders
 12. **Verify the admin entrypoint** — GET `https://nippo-sync.vercel.app/lp/{slug}/admin`, confirm it returns the ConnectScreen (sign-in prompt) and NOT the "LPが見つかりません" 404 screen. If the latter, the lp_admins insert in step 10.3 was skipped — go back and insert it.
+12.5. **Generate owner-claim link for client handover** — INSERT a row into `public.lp_claim_tokens` so the user can send a single URL to the client for first-time ownership. The claim flow will DEMOTE Jayden's pre-seeded admin rows to `member` (preserving Google OAuth tokens so the sheet sync keeps working) and make the client the sole `owner`.
+    ```sql
+    insert into public.lp_claim_tokens (lp_slug, role, note, created_by, reset_admins, expires_at)
+    values ('{slug}', 'owner', '{client_name}様への初回オーナー権限の引き渡しリンク',
+            'jayden.barnes@mgc-global01.com', true, now() + interval '14 days')
+    returning token;
+    ```
+    The returned UUID is substituted into `https://nippo-sync.vercel.app/lp/{slug}/claim?token={uuid}` — the client visits this URL, enters their work email, becomes the sole owner, and lands in the admin dashboard with a success toast. They can then delete test entries via the per-entry delete button (owner-only) and add secondary admins via the existing invite UI.
+
 13. **Hand off** — return to user:
     - Live URL: `https://nippo-sync.vercel.app/lp/{slug}`
     - Admin URL: `https://nippo-sync.vercel.app/lp/{slug}/admin`
-    - Provenance report (which fields are scraped vs preset vs AI)
+    - **Claim link for client** (from step 12.5): `https://nippo-sync.vercel.app/lp/{slug}/claim?token={uuid}`
+    - Provenance report (which fields are scraped vs preset vs AI, including `logo: scraped|fallback_letter`)
     - Image source breakdown (scraped/enhanced/generated/unsplashed counts)
     - Suggestion: "After polishing, run `/save-preset {industry}` to update the preset"
 
@@ -172,6 +191,8 @@ The skill orchestrator is `scripts/bootstrap.py` on the VM at `/home/ubuntu/mgc-
 
 **RULE 9 — Audience pivot is mandatory before insert.** The composer is a structural draft, not the final content. Whenever the source site is a B2B service business (consulting, agency, SaaS, anything that sells *to other businesses*), its homepage paragraphs are pitching services to *clients*, NOT recruiting *job seekers*. Verbatim copying produces sales copy in the strengths section instead of employer branding. Claude MUST review and rewrite hero/about/strengths/cta from a job-seeker frame at workflow step 8.5 BEFORE the Supabase insert. The composer always sets `provenance.audience_pivot_review_needed: true` as a reminder — Claude flips it to false only after rewriting. The cloq pivot is the canonical example: client-facing "we deeply understand your hiring problem, we PDCA your funnel" was rewritten as candidate-facing "you'll get hands-on実務スキル, work in a flat 本音-driven team, in a 在宅可・服装自由 environment".
 
+**RULE 10 — Handover uses the claim link, not OAuth.** For first-time client handover, the skill MUST generate a row in `public.lp_claim_tokens` and return the `/lp/{slug}/claim?token={uuid}` URL in the handoff message (workflow step 12.5 + 13). Do NOT rely on the client's Google OAuth as the primary owner-creation path — that requires them to have a Google account AND to understand what "最初にサインインした方がオーナーになります" means. The claim link is simpler: one URL, enter your email, you're the owner. The `reset_admins=true` flag in the token row triggers a DEMOTE of Jayden's pre-seeded admin rows (NOT a DELETE — that would wipe google_refresh_token and break the sheet sync). The demoted rows stay as `member` with tokens intact, so auto-sync to the Google Sheet keeps working after handover. The client can revoke demoted members manually via the admin dashboard if they want full separation. Tokens expire in 14 days and are single-use — after the client claims, the same URL returns the "already used" error screen.
+
 **RULE 7 — Industry preset auto-update is OPT-IN.** After polishing, the system suggests "save these as the new {industry} default preset?" but never auto-saves.
 
 **RULE 8 — Reference URL is the client's OWN site by default.** A second `style_url` is optional and only affects design tokens (theme colors, font hints), never content.
@@ -181,6 +202,8 @@ The skill orchestrator is `scripts/bootstrap.py` on the VM at `/home/ubuntu/mgc-
 ## Verification gate (skill is "done" when these all pass)
 
 - [ ] `provenance.audience_pivot_review_needed` is `false` in the final payload (i.e. Claude actually did step 8.5)
+- [ ] `provenance.logo` is `scraped` (or `fallback_letter` only when the source site genuinely has no usable logo — flag this to the user explicitly)
+- [ ] A claim link was generated via step 12.5 and included in the handoff message — without this the client can't take ownership
 
 - [ ] Skill triggers on the example phrases
 - [ ] cloq.jp end-to-end produces a live LP at `/lp/cloq` within 2 minutes
