@@ -47,8 +47,10 @@ These are already in place as of 2026-04-09. The skill assumes them.
 |---|---|---|
 | nippo-sync repo | `/home/ubuntu/nippo-sync/` (Jayden's) | Hosts the `/lp/[slug]` route + admin editor |
 | Supabase project | `pglaffdnhixmabcjdxbi` (`nippo-sync`) | Stores `lps`, `lp_content`, `industry_presets`, `lp_assets` |
-| Bootstrap endpoint | `POST /api/admin/lp-content-upsert?slug={slug}` | Where the composed LpContent gets posted |
-| Auth header | `x-migration-secret: $MIGRATION_RUNNER_SECRET` | Required for the upsert endpoint |
+| Master registry | `public.lps` table | Source of truth for LP existence; insert here first with `created_via='skill'` |
+| Content storage | `public.lp_content` table | JSONB content blob keyed by `lp_slug` |
+| Admin access | `public.lp_admins` table | Auto-create owner row for `jayden.barnes@mgc-global01.com` so the dashboard works on first visit |
+| Upsert path | Supabase MCP `execute_sql` (preferred) or `apply_migration` for transactional safety | No HTTP endpoint or migration secret needed when running from Claude — direct DB access via MCP |
 | Storage bucket | `lp-assets` (public read) | Where all skill-generated images land |
 | Industry preset | `industry_presets` table, `製造業/default` row | Welfare items, data pills, hero EN titles for fallback |
 
@@ -100,9 +102,13 @@ The skill orchestrator is `scripts/bootstrap.py` on the VM at `/home/ubuntu/mgc-
    - **cta** + **footer** ← ContentBundle.address/tel + AI-generated CTA copy
    - **theme** ← Aura colors
 9. **Image pipeline** — see image strategy table below
-10. **POST** `/api/admin/lp-content-upsert?slug={slug}` with the full composed LpContent JSON
-11. **Update** `lps.status = 'live'`
-12. **Verify** — GET `https://nippo-sync.vercel.app/lp/{slug}`, confirm 200 + content renders
+10. **Insert via Supabase MCP** (single transaction preferred) — use `Supabase:execute_sql` against project `pglaffdnhixmabcjdxbi`:
+    1. `INSERT INTO public.lps` if not already done in step 3
+    2. `INSERT INTO public.lp_content (lp_slug, content, published) VALUES (...)` with the composed LpContent as a `$LPCONTENT$...$LPCONTENT$::jsonb` dollar-quoted literal (avoids escaping the Japanese + nested quotes mess)
+    3. `INSERT INTO public.lp_admins (lp_slug, email, role)` for `jayden.barnes@mgc-global01.com` as `owner` AND `jayden.barnes.cs@gmail.com` as `member`. Without this row the `/lp/{slug}/admin` page treats the LP as nonexistent (the `fetchCompanyAndExists` function checks lp_admins as one of the existence signals).
+    4. `UPDATE public.lps SET status = 'live' WHERE slug = '{slug}'`
+11. **Verify** — GET `https://nippo-sync.vercel.app/lp/{slug}`, confirm 200 + content renders
+12. **Verify the admin entrypoint** — GET `https://nippo-sync.vercel.app/lp/{slug}/admin`, confirm it returns the ConnectScreen (sign-in prompt) and NOT the "LPが見つかりません" 404 screen. If the latter, the lp_admins insert in step 10.3 was skipped — go back and insert it.
 13. **Hand off** — return to user:
     - Live URL: `https://nippo-sync.vercel.app/lp/{slug}`
     - Admin URL: `https://nippo-sync.vercel.app/lp/{slug}/admin`
