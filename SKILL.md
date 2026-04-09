@@ -1,6 +1,6 @@
 ---
 name: mgc-saiyo-lp-bootstrap
-description: Use this skill whenever the user wants to create a 採用LP (Japanese recruitment landing page) for a client by referencing an existing website. Triggers on the keyword "採用LP" combined with a URL in the same message. Examples that fire this skill - "作って 採用LP for 株式会社CLOQ from https://cloq.jp/", "採用LP cloq https://cloq.jp/", "Build a 採用LP, reference: https://cloq.jp/, style ref: https://taf-jp.com/recruitment/". The skill scrapes the reference site (multi-page crawl + Aura design extraction), composes a complete LpContent JSON, posts it to nippo-sync's /api/admin/lp-content-upsert endpoint, and hands off a live URL at nippo-sync.vercel.app/lp/{slug} in under 2 minutes. Do NOT trigger this skill for editing an existing LP - that work happens in the per-LP admin editor at /lp/{slug}/admin.
+description: Creates a brand-new Japanese 採用LP (recruitment landing page) for a client from a single reference URL. Fires whenever the user mentions 採用LP (or "recruitment LP" / "saiyo LP") alongside a URL and a client name in the same message — examples that trigger: "作って 採用LP for 株式会社CLOQ https://cloq.jp/", "採用LP cloq https://cloq.jp/", "採用LPを作って https://cloq.jp/ 株式会社CLOQ", "Build a recruitment LP for ABC, ref https://example.jp/", "新しいクライアントのLP作って 株式会社X https://x.jp/". Runs end-to-end without mid-flow questions: multi-page crawl of the reference site (extracts 会社概要 / 募集要項 / logo / colors via <dl>/<img>/CSS walks), composes a structural LpContent draft, performs mandatory audience-pivot rewrite of hero / about / strengths / cta so the content targets job seekers not clients, inserts via Supabase MCP into project pglaffdnhixmabcjdxbi, creates the Google Sheet for entries auto-sync, generates an owner-claim link for first-time client handover, and returns a live URL at nippo-sync.vercel.app/lp/{slug} plus the claim URL to send to the client. Target: under 2 minutes from prompt to shipping. Do NOT fire this for editing an existing LP (that happens in the admin editor at /lp/{slug}/admin) or for updating copy / images / layout on a live LP.
 ---
 
 # mgc-saiyo-lp-bootstrap
@@ -21,21 +21,47 @@ This is the philosophical opposite of the old `saiyo-lp-skill` which had "always
 
 ## Trigger
 
-The skill activates when **all three** are present in the user's message:
+The skill activates when the user clearly wants a new 採用LP built from a reference URL. The reliable signals are:
 
-1. The keyword `採用LP` (Japanese characters, exact match)
-2. A URL (the reference site — typically the client's own corporate site)
-3. A client name (Japanese OK, e.g. `株式会社CLOQ`, or English like `cloq`)
+1. **The keyword** — any of: `採用LP`, `採用ランディング`, `採用ページ作って`, `recruitment LP`, `recruitment landing`, `saiyo LP`, `saiyo-lp`, `new LP for`
+2. **A URL** — the reference site, typically the client's own corporate site (`https://...`)
+3. **A client name** — Japanese (`株式会社CLOQ`), English (`cloq`, `CLOQ`), or the slug form inferable from the URL hostname
 
-Examples that fire:
+All three need to be present or inferable from context. If two out of three are there (e.g. keyword + URL but no client name), infer the missing piece rather than asking: derive the client name from the page's `<title>` or `og:site_name` on first fetch.
+
+**Examples that FIRE the skill (build immediately, no clarifying questions):**
 
 - `作って 採用LP for 株式会社CLOQ from https://cloq.jp/`
 - `採用LP cloq https://cloq.jp/`
+- `採用LPを作って https://cloq.jp/ 株式会社CLOQ`
 - `Build a 採用LP, reference: https://cloq.jp/, style ref: https://taf-jp.com/recruitment/`
-- `Make a 採用LP for ABC建設, their site is https://example.jp/`
+- `Make a recruitment LP for ABC建設, their site is https://example.jp/`
+- `新しいクライアントのLP作ってほしい 株式会社X https://x.jp/`
+- `saiyo-lp for https://cloq.jp`  (infer client name from `<title>`)
 
-If only `採用LP` is present without a URL, ask for the reference URL once, then proceed.
-If only a URL is present without `採用LP`, do NOT trigger — could be any other request.
+**Examples that DO NOT fire:**
+
+- `cloq の LPを編集して` — "edit the LP" means use the admin editor at `/lp/cloq/admin`, not rebuild
+- `cloqのLPの求人を追加して` — adding/changing openings happens in the admin editor
+- `https://cloq.jp/ の情報を教えて` — URL without `採用LP` keyword is a research request
+- `採用LPのテンプレートを作って` — no specific client or URL, this is a meta request about the skill itself
+
+**One-shot mandate**: once the skill fires, run the entire workflow start-to-finish without stopping to ask questions. The only acceptable mid-flow interruptions are (a) slug collision against an existing `lps` row (abort, ask for overwrite or new slug) or (b) Supabase insert genuinely fails (report the error). Every other ambiguity is resolved by picking the most plausible interpretation and noting it in the provenance report.
+
+---
+
+## What the user gets back when the skill finishes
+
+When the skill completes successfully, Claude returns a single message with:
+
+1. **Live URL** — `https://nippo-sync.vercel.app/lp/{slug}` — open in a browser, renders immediately
+2. **Admin URL** — `https://nippo-sync.vercel.app/lp/{slug}/admin` — for Jayden (the existing pre-seeded owner) to polish
+3. **Claim URL** — `https://nippo-sync.vercel.app/lp/{slug}/claim?token={uuid}` — the one-click owner-claim link to send to the client. 14-day expiry, single-use, with DEMOTE semantics (doesn't wipe Jayden's tokens so the sheet sync keeps working)
+4. **Google Sheet URL** — the auto-sync sheet for entries, sitting in Jayden's Google Drive
+5. **Provenance report** — every field labeled `scraped` | `scraped_dl` | `preset` | `default` | `ai_generated` | `fallback_letter` so the user knows what's real vs placeholder
+6. **Polish checklist** — 2-4 specific things Claude recommends touching up manually before sending to the client (e.g. "the data pills are industry-preset defaults, swap in real numbers if you have them", "voices.items uses placeholder names — replace with real employees after they start")
+
+The user's first action after seeing this message should be: open the live URL, glance at the LP, approve → send the claim URL to the client.
 
 ---
 
