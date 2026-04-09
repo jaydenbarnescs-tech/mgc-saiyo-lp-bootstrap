@@ -1,6 +1,6 @@
 ---
 name: mgc-saiyo-lp-bootstrap
-description: Creates a brand-new Japanese 採用LP (recruitment landing page) for a client from a single reference URL. Fires whenever the user mentions 採用LP (or "recruitment LP" / "saiyo LP") alongside a URL and a client name in the same message — examples that trigger: "作って 採用LP for 株式会社CLOQ https://cloq.jp/", "採用LP cloq https://cloq.jp/", "採用LPを作って https://cloq.jp/ 株式会社CLOQ", "Build a recruitment LP for ABC, ref https://example.jp/", "新しいクライアントのLP作って 株式会社X https://x.jp/". Runs end-to-end without mid-flow questions: multi-page crawl of the reference site (extracts 会社概要 / 募集要項 / logo / colors via <dl>/<img>/CSS walks), composes a structural LpContent draft, performs mandatory audience-pivot rewrite of hero / about / strengths / cta so the content targets job seekers not clients, inserts via Supabase MCP into project pglaffdnhixmabcjdxbi, creates the Google Sheet for entries auto-sync, generates an owner-claim link for first-time client handover, and returns a live URL at nippo-sync.vercel.app/lp/{slug} plus the claim URL to send to the client. Target: under 2 minutes from prompt to shipping. Do NOT fire this for editing an existing LP (that happens in the admin editor at /lp/{slug}/admin) or for updating copy / images / layout on a live LP.
+description: Creates a brand-new Japanese 採用LP (recruitment landing page) for a client from a single reference URL. Fires whenever the user mentions 採用LP (or "recruitment LP" / "saiyo LP") alongside a URL and a client name in the same message — examples that trigger: "作って 採用LP for 株式会社CLOQ https://cloq.jp/", "採用LP cloq https://cloq.jp/", "採用LPを作って https://cloq.jp/ 株式会社CLOQ", "Build a recruitment LP for ABC, ref https://example.jp/", "新しいクライアントのLP作って 株式会社X https://x.jp/". Runs end-to-end without mid-flow questions: multi-page crawl of the reference site (extracts 会社概要 / 募集要項 / logo / colors via <dl>/<img>/CSS walks), composes a structural LpContent draft, performs mandatory audience-pivot rewrite of hero / about / strengths / cta so the content targets job seekers not clients, inserts via Supabase MCP into project pglaffdnhixmabcjdxbi, creates the Google Sheet for entries auto-sync, registers the LP in the public.lps master registry so the deterministic first-setup URL /lp/{slug}/admin?first is activated, and returns the live URL at nippo-sync.vercel.app/lp/{slug} plus the /admin?first handover URL for the client. Target: under 2 minutes from prompt to shipping. Do NOT fire this for editing an existing LP (that happens in the admin editor at /lp/{slug}/admin) or for updating copy / images / layout on a live LP.
 ---
 
 # mgc-saiyo-lp-bootstrap
@@ -56,12 +56,12 @@ When the skill completes successfully, Claude returns a single message with:
 
 1. **Live URL** — `https://nippo-sync.vercel.app/lp/{slug}` — open in a browser, renders immediately
 2. **Admin URL** — `https://nippo-sync.vercel.app/lp/{slug}/admin` — for Jayden (the existing pre-seeded owner) to polish
-3. **Claim URL** — `https://nippo-sync.vercel.app/lp/{slug}/claim?token={uuid}` — the one-click owner-claim link to send to the client. 14-day expiry, single-use, with DEMOTE semantics (doesn't wipe Jayden's tokens so the sheet sync keeps working)
+3. **First-setup URL** — `https://nippo-sync.vercel.app/lp/{slug}/admin?first` — the deterministic one-shot owner-claim link to send to the client. No token, no expiry — the URL is the same for every LP and is always ready until it has been used exactly once. After the first claim, it's permanently locked via `public.lps.handed_over_at` and the client sees a "引き渡し済みです" screen. DEMOTE semantics preserve Jayden's google_refresh_token so sheet sync keeps working
 4. **Google Sheet URL** — the auto-sync sheet for entries, sitting in Jayden's Google Drive
 5. **Provenance report** — every field labeled `scraped` | `scraped_dl` | `preset` | `default` | `ai_generated` | `fallback_letter` so the user knows what's real vs placeholder
 6. **Polish checklist** — 2-4 specific things Claude recommends touching up manually before sending to the client (e.g. "the data pills are industry-preset defaults, swap in real numbers if you have them", "voices.items uses placeholder names — replace with real employees after they start")
 
-The user's first action after seeing this message should be: open the live URL, glance at the LP, approve → send the claim URL to the client.
+The user's first action after seeing this message should be: open the live URL, glance at the LP, approve → send the `/admin?first` URL to the client. That URL will work exactly once, and afterwards it's permanently locked — no need to clean up claim tokens or set expiry dates.
 
 ---
 
@@ -168,19 +168,16 @@ The skill orchestrator is `scripts/bootstrap.py` on the VM at `/home/ubuntu/mgc-
     4. INSERT into `public.lp_sheet_configs` with `connection_type='oauth'`, `auto_sync=true`, `worksheet_name='Entries'`, `last_sync_status='success'`, `last_synced_count=0`. After this, every form submission to `/api/lp-entry` will auto-append to the sheet via the existing handler logic.
 11. **Verify** — GET `https://nippo-sync.vercel.app/lp/{slug}`, confirm 200 + content renders
 12. **Verify the admin entrypoint** — GET `https://nippo-sync.vercel.app/lp/{slug}/admin`, confirm it returns the ConnectScreen (sign-in prompt) and NOT the "LPが見つかりません" 404 screen. If the latter, the lp_admins insert in step 10.3 was skipped — go back and insert it.
-12.5. **Generate owner-claim link for client handover** — INSERT a row into `public.lp_claim_tokens` so the user can send a single URL to the client for first-time ownership. The claim flow will DEMOTE Jayden's pre-seeded admin rows to `member` (preserving Google OAuth tokens so the sheet sync keeps working) and make the client the sole `owner`.
-    ```sql
-    insert into public.lp_claim_tokens (lp_slug, role, note, created_by, reset_admins, expires_at)
-    values ('{slug}', 'owner', '{client_name}様への初回オーナー権限の引き渡しリンク',
-            'jayden.barnes@mgc-global01.com', true, now() + interval '14 days')
-    returning token;
-    ```
-    The returned UUID is substituted into `https://nippo-sync.vercel.app/lp/{slug}/claim?token={uuid}` — the client visits this URL, enters their work email, becomes the sole owner, and lands in the admin dashboard with a success toast. They can then delete test entries via the per-entry delete button (owner-only) and add secondary admins via the existing invite UI.
+12.5. **First-setup URL is deterministic — no token generation needed** — as of `nippo-sync@eb81779` the client-handover URL has no token. It's always `https://nippo-sync.vercel.app/lp/{slug}/admin?first`. Every LP in `public.lps` has this URL available immediately after registry insertion in step 3 (the lps row creation), and it stays active until exactly one client claims it.
+
+    When a client visits the URL and submits their email, `POST /api/lp/{slug}/admin-first-setup` atomically: (a) locks the lps row with `SELECT FOR UPDATE`, (b) verifies `handed_over_at IS NULL`, (c) DEMOTEs existing owners to `member` (preserving `google_refresh_token` so sheet sync keeps working), (d) UPSERTs the claimer as owner, (e) sets `lps.handed_over_at = now()` + `handed_over_by_email`. Any subsequent visit to `?first` shows the "引き渡し済みです" amber lock screen with the handover timestamp. There is no way to reset this — it is a one-shot capability spent exactly once per slug.
+
+    **No code changes needed for this step.** Just include the URL in the handoff message in step 13.
 
 13. **Hand off** — return to user:
     - Live URL: `https://nippo-sync.vercel.app/lp/{slug}`
     - Admin URL: `https://nippo-sync.vercel.app/lp/{slug}/admin`
-    - **Claim link for client** (from step 12.5): `https://nippo-sync.vercel.app/lp/{slug}/claim?token={uuid}`
+    - **First-setup URL for client** (from step 12.5): `https://nippo-sync.vercel.app/lp/{slug}/admin?first` — send this to the client via email/Slack/LINE. Works exactly once, permanently locks after.
     - Provenance report (which fields are scraped vs preset vs AI, including `logo: scraped|fallback_letter`)
     - Image source breakdown (scraped/enhanced/generated/unsplashed counts)
     - Suggestion: "After polishing, run `/save-preset {industry}` to update the preset"
@@ -217,7 +214,9 @@ The skill orchestrator is `scripts/bootstrap.py` on the VM at `/home/ubuntu/mgc-
 
 **RULE 9 — Audience pivot is mandatory before insert.** The composer is a structural draft, not the final content. Whenever the source site is a B2B service business (consulting, agency, SaaS, anything that sells *to other businesses*), its homepage paragraphs are pitching services to *clients*, NOT recruiting *job seekers*. Verbatim copying produces sales copy in the strengths section instead of employer branding. Claude MUST review and rewrite hero/about/strengths/cta from a job-seeker frame at workflow step 8.5 BEFORE the Supabase insert. The composer always sets `provenance.audience_pivot_review_needed: true` as a reminder — Claude flips it to false only after rewriting. The cloq pivot is the canonical example: client-facing "we deeply understand your hiring problem, we PDCA your funnel" was rewritten as candidate-facing "you'll get hands-on実務スキル, work in a flat 本音-driven team, in a 在宅可・服装自由 environment".
 
-**RULE 10 — Handover uses the claim link, not OAuth.** For first-time client handover, the skill MUST generate a row in `public.lp_claim_tokens` and return the `/lp/{slug}/claim?token={uuid}` URL in the handoff message (workflow step 12.5 + 13). Do NOT rely on the client's Google OAuth as the primary owner-creation path — that requires them to have a Google account AND to understand what "最初にサインインした方がオーナーになります" means. The claim link is simpler: one URL, enter your email, you're the owner. The `reset_admins=true` flag in the token row triggers a DEMOTE of Jayden's pre-seeded admin rows (NOT a DELETE — that would wipe google_refresh_token and break the sheet sync). The demoted rows stay as `member` with tokens intact, so auto-sync to the Google Sheet keeps working after handover. The client can revoke demoted members manually via the admin dashboard if they want full separation. Tokens expire in 14 days and are single-use — after the client claims, the same URL returns the "already used" error screen.
+**RULE 10 — Handover uses the `/admin?first` URL, not OAuth, not tokens.** For first-time client handover, the skill returns the deterministic URL `/lp/{slug}/admin?first` in the handoff message (workflow step 13). No token generation, no SQL inserts into claim tables, no expiry dates to manage. The URL is always the same for a given slug and is always ready from the moment the `lps` row exists (step 3). Do NOT rely on the client's Google OAuth as the primary owner-creation path — that requires them to have a Google account AND to understand the (now-removed) "最初にサインインした方がオーナーになります" note. `/admin?first` is simpler: one URL, enter your email, you're the owner. The `admin-first-setup` endpoint DEMOTEs Jayden's pre-seeded admin rows to `member` (NOT DELETE — that would wipe `google_refresh_token` and break the sheet sync). The demoted rows stay as `member` with tokens intact, so auto-sync keeps working. The client can revoke demoted members manually via the admin dashboard if they want full separation.
+
+**RULE 11 — `/admin?first` is permanently one-shot. Once used, it's dead forever.** After the first successful claim, `public.lps.handed_over_at` is set to a non-null timestamp and the `/admin?first` URL returns a "引き渡し済みです" lock screen. There is no API, no SQL, no dashboard button to reset this — it's intentionally permanent so there's no way for a confused or malicious owner to regenerate the one-shot capability and wrest control. Subsequent handoffs happen via the normal invite flow in the admin dashboard (owner → member invitation), not new `?first` links. If the user asks to "reset" or "regenerate" the first-setup link for an already-claimed LP, Claude MUST refuse and explain that this is by design — the only recovery paths are: (a) the current owner invites a new admin via the dashboard, or (b) Jayden edits the `lps.handed_over_at` column directly via Supabase MCP as an emergency override (document this clearly to the user, never do it silently).
 
 **RULE 7 — Industry preset auto-update is OPT-IN.** After polishing, the system suggests "save these as the new {industry} default preset?" but never auto-saves.
 
@@ -229,7 +228,7 @@ The skill orchestrator is `scripts/bootstrap.py` on the VM at `/home/ubuntu/mgc-
 
 - [ ] `provenance.audience_pivot_review_needed` is `false` in the final payload (i.e. Claude actually did step 8.5)
 - [ ] `provenance.logo` is `scraped` (or `fallback_letter` only when the source site genuinely has no usable logo — flag this to the user explicitly)
-- [ ] A claim link was generated via step 12.5 and included in the handoff message — without this the client can't take ownership
+- [ ] The `/lp/{slug}/admin?first` URL is included in the handoff message (no token generation needed — the URL is deterministic once the lps row exists). Without this the client can't take ownership.
 
 - [ ] Skill triggers on the example phrases
 - [ ] cloq.jp end-to-end produces a live LP at `/lp/cloq` within 2 minutes
