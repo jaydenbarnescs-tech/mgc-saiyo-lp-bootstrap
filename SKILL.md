@@ -131,6 +131,28 @@ Additionally, the editor's back button MUST be in the **header-left** (right aft
 
 Any future admin feature that wraps an existing heavy editor component in the sidebar MUST follow the same pattern. The rule is "cards and landing screens are cheap, context is not." Precedent commit: `dc7d513`.
 
+### 9. NEVER use independent subqueries to generate correlated random columns
+
+PostgreSQL's optimizer treats `(SELECT ... ORDER BY random() LIMIT 1)` subqueries inside an INSERT as scalar constants — they're evaluated ONCE for the whole statement, not once per row. This means two independent random subqueries in the same INSERT will both pick a single value and apply it to every row. We hit this in `analytics_bootstrap.py`'s seed SQL: `referrer` and `referrer_domain` were two independent `(SELECT … FROM referrer_pool ORDER BY random() LIMIT 1)` subqueries, and all 3,172 cloq rows ended up with `referrer='google'` AND `referrer_domain='bing.com'` — both stuck on a single pick, AND mismatched against each other.
+
+**Fix pattern**: precompute random values in a CTE one row at a time using `CROSS JOIN LATERAL generate_series(...)` (which forces per-row evaluation), then derive correlated columns from those values via `CASE` expressions:
+
+```sql
+WITH exploded AS (
+  SELECT day, gs.i FROM days CROSS JOIN LATERAL generate_series(1, day_count) gs(i)
+),
+with_random AS (
+  SELECT day, i, random() AS r_ref FROM exploded
+)
+INSERT INTO target (referrer, referrer_domain)
+SELECT
+  CASE WHEN r_ref < 0.4 THEN 'https://google.com/search' WHEN r_ref < 0.55 THEN 'https://t.co/x' ... END,
+  CASE WHEN r_ref < 0.4 THEN 'google.com'                WHEN r_ref < 0.55 THEN 'twitter.com'    ... END
+FROM with_random;
+```
+
+This guarantees both per-row variety AND consistency between columns. Documented as H54 in Category 16. Precedent: 2026-04-10 cloq reseed.
+
 
 ---
 
@@ -445,7 +467,14 @@ The skill must never ship a LP where any of these 4 parts is missing. Use `scrip
 - **~280 form_starts** (~35% of form_views start typing)
 - The `form_submits` are the 15 `lp_entries` from above, so conversion = ~0.5% which is realistic for a warm LP
 
-**CRUCIAL**: label all seeded rows with `user_agent LIKE '%fake-backfill%'` or a similar marker so the client can bulk-delete them in one SQL statement if they want a clean slate, AND so the dashboard's 全削除 button can filter them out. The skill's bootstrap script MUST also tell the user in the handoff message: "the dashboard is pre-seeded with demo data — use the 全削除 button to clear it before the real traffic starts". Precedent: `dc7d513` cloq seed.
+**CRUCIAL**: label all seeded rows so the client can bulk-delete them and so the handover transaction can wipe them automatically. Tagging convention:
+- `lp_page_views.user_agent LIKE '%fake-backfill%'`
+- `lp_form_events.session_id` references back to those page views (no direct marker, found via JOIN)
+- `lp_entries.source = 'lp_form_demo'` (NOT the default `'lp_form'`)
+
+These tags are used by THREE consumers: (1) the OAuth callback handover transaction (`src/app/api/sheets/connect/callback/route.ts`), (2) the email-only fallback transaction (`src/app/api/lp/[slug]/admin-first-setup/route.ts`), and (3) the dashboard's 全削除 button + the `analytics_bootstrap.py` cleanup SQL. All three filter on the same tags, so adding new seed data in the future MUST use these exact tags or it won't get cleaned up.
+
+**Handover automatically resets the analytics.** As of 2026-04-10, both handover paths run the cleanup SQL inside the same atomic transaction as `UPDATE lps SET handed_over_at`. Either everything commits (claim succeeds + demo wiped + client sees empty dashboard ready for real traffic) or nothing commits (claim fails + demo stays for retry). This means: the seed data is visible during the build session for sanity-checking the dashboard, persists through any pre-handover testing, but is automatically wiped the moment the client signs in. No manual cleanup step needed. Precedent: `dc7d513` (initial seed) + `9b22739` (handover cleanup + LATERAL fix).
 
 **RULE 22 — LP編集 section MUST be a two-state landing screen, never a direct jump.** See Critical Constraint #8. The landing card shows: hero CTA with 編集を開始 + 公開中のLPを開く buttons, 4-stat quick grid (PV / 応募率 / 応募総数 / 新規応募 — all from real data via useAdmin), 6-tile section overview (ヒーロー/募集職種/福利厚生/会社情報/メンバーの声/FAQ with icons and descriptions), usage tips card explaining the difference between 「変更をプレビュー」 (in-editor, shows unsaved changes) vs 「公開中のLPを開く」 (live site, shows last saved state). The editor component renders only after clicking 編集を開始 and returns to the landing on `← ダッシュボードに戻る`, NOT to a different section. This prevents the "I opened LP編集 and got dropped into a WordPress clone with no context" confusion.
 
@@ -625,6 +654,12 @@ This category captures the 3-turn session that replaced the old admin dashboard 
 **H52 — `collapsible="none"` breaks mobile even worse than the overlap bug it fixes.** I hit the bare-variable bug (H47) and reached for `collapsible="none"` as a quick fix — this replaces the shadcn Sidebar's fixed positioning with a plain flex layout so the spacer div actually takes up space. But `"none"` also disables the mobile Sheet drawer, so on mobile the sidebar becomes an always-visible 256px column that eats 2/3 of the viewport. **Real fix is fixing the bare-variable bug at the source** (H47). If you find yourself reaching for `collapsible="none"` as a workaround, stop — you're masking the real bug. Precedent: `83f5266` (the wrong fix) → `780f440` (the right fix).
 
 **H53 — `sonner` `<Toaster>` must be mounted once in `src/app/layout.tsx`, not per-page.** The Lovable export uses `toast()` from sonner throughout but doesn't include the `<Toaster>` provider — it assumes the host project has it mounted. nippo-sync already has `<Toaster richColors position="top-right" />` in `src/app/layout.tsx:25` from a previous session, so nothing needed to be added. But if you're porting this pattern to a NEW host project that doesn't have it, add the Toaster to the root layout, not to AdminDashboard — otherwise toasts from other pages won't render. Also: no `import { Toaster }` needed in AdminDashboard.tsx itself; just `import { toast } from 'sonner'` and fire.
+
+**H54 — Seed SQL with two independent `(SELECT … ORDER BY random() LIMIT 1)` subqueries collapses to a single random pick per statement.** First version of `analytics_bootstrap.py`'s seed had `referrer` and `referrer_domain` as two separate `(SELECT … FROM referrer_pool ORDER BY random() LIMIT 1)` subqueries, expecting each row to get its own random pick. PostgreSQL's optimizer evaluated each subquery ONCE for the whole INSERT (treating them as constant scalar subqueries), so all 3,172 cloq rows ended up with `referrer='https://www.google.com/search'` AND `referrer_domain='bing.com'` — a stuck pair, AND mismatched against each other. The 流入元 chart showed Bing 99.7% / Direct 0.3%. **Fix**: precompute a `random()` value per row inside a CTE (`with_random AS (SELECT ..., random() AS r_ref FROM exploded)`) and use it as the bucket selector in `CASE` statements for BOTH `referrer` and `referrer_domain` — guarantees per-row variety AND consistency between the two columns. Distribution after fix: Google 39.5% / Direct 22.7% / Twitter 14.8% / LinkedIn 9.6% / Bing 5.1% / Facebook 4.8% / Instagram 3.5%. Generalization: anywhere you need correlated random picks across multiple columns of the same row in PostgreSQL, **always materialize the random value in a CTE first** — never trust two independent subqueries to give you matching random values. Precedent: cloq reseed during the 2026-04-10 fix session.
+
+**H55 — Handover MUST reset demo analytics inside the same transaction as the `handed_over_at` lock.** Initial design left the demo data in place after handover, which would have meant the client signs in and immediately sees fake Japanese names like 山田健太 + made-up Twitter referrers in their dashboard. The fix is in BOTH handover paths (`src/app/api/sheets/connect/callback/route.ts` and `src/app/api/lp/[slug]/admin-first-setup/route.ts`): three `DELETE` statements run inside the same atomic transaction as the `UPDATE lps SET handed_over_at`, so either everything commits (claim succeeds + demo wiped) or nothing commits (claim fails + demo stays for retry). The deletes target `lp_page_views WHERE user_agent LIKE '%fake-backfill%'`, `lp_form_events WHERE session_id IN (...)`, and `lp_entries WHERE source = 'lp_form_demo'`. **Critical detail**: the seed SQL MUST tag entries with `source = 'lp_form_demo'` (not the default `'lp_form'`) so the cleanup can distinguish them from any real submissions that came in before handover. Real entries are never touched. Precedent: nippo-sync@9b22739, mgc-saiyo-lp-bootstrap analytics_bootstrap.py update.
+
+**H56 — Analytics widgets do NOT belong on the LP編集 landing screen.** First version of LpEditSection landing showed 4 stat cards (PV / 応募率 / 応募総数 / 新規応募) — but PV and 応募率 are analytics that should only live on the Dashboard tab. Putting them on LP編集 confused the section's purpose ("am I editing content or looking at stats?") and required the section to load analytics on mount, which slowed it down. **Fix**: LpEditSection landing now shows ONLY 応募総数 + 新規応募 (entry-related stats from `useAdmin().entries`, no analytics fetch needed). The Dashboard tab is the canonical home for all analytics. Generalization: each tab should have ONE clear purpose, and stat cards should match that purpose. Don't sprinkle analytics across multiple tabs.
 
 ---
 

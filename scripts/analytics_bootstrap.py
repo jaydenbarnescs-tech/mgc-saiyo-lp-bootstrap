@@ -148,25 +148,40 @@ SELECT
 
 SEED_SQL_TEMPLATE = r"""
 -- Seed 15 realistic test entries for {slug}
+-- All seeded entries use source = 'lp_form_demo' so handover cleanup
+-- can DELETE them in one statement without touching real submissions.
 INSERT INTO public.lp_entries (lp_slug, created_at, name, email, phone, position, message, status, notes, source)
 VALUES
-  ('{slug}', now() - interval '1 hour',  '山田 健太',   'yamada.kenta@example.com',   '090-1234-5678', '募集職種A', '御社のビジョンに共感しました。業界経験3年、新しい挑戦をしたいです。', 'new',       NULL, 'lp_form'),
-  ('{slug}', now() - interval '3 hours', '佐藤 美咲',   'sato.misaki@example.com',    '080-2345-6789', '募集職種B', 'デザイナーとして5年の経験があります。ポートフォリオあります。', 'new',       NULL, 'lp_form'),
-  ('{slug}', now() - interval '8 hours', '鈴木 翔太',   'suzuki.shota@example.com',   '070-3456-7890', '募集職種A', 'HRテックに興味があり、業務の最適化に貢献したいです。', 'seen',      '返信済み。カジュアル面談調整中', 'lp_form'),
-  ('{slug}', now() - interval '1 day',   '田中 愛子',   'tanaka.aiko@example.com',    NULL,            '募集職種B', NULL, 'new', NULL, 'lp_form'),
-  ('{slug}', now() - interval '2 days',  '高橋 大輔',   'takahashi.d@example.com',    '090-4567-8901', '募集職種A', '前職は営業5年。人と関わる仕事が好きです。', 'contacted', '1次面談予定',                      'lp_form'),
-  ('{slug}', now() - interval '3 days',  '伊藤 さくら', 'ito.sakura@example.com',     '080-5678-9012', '募集職種B', 'コピーライティングとUI/UXデザインが得意です。', 'contacted', 'ポートフォリオ確認中',             'lp_form'),
-  ('{slug}', now() - interval '5 days',  '渡辺 達也',   'watanabe.t@example.com',     '070-6789-0123', '募集職種A', '京都在住。スタートアップ経験あり。',     'rejected',  '経験不足',                          'lp_form'),
-  ('{slug}', now() - interval '6 days',  '中村 優奈',   'nakamura.y@example.com',     '090-7890-1234', '募集職種A', '人材紹介会社で3年。個人の成長に寄り添いたい。', 'contacted', '2次面談調整中',            'lp_form'),
-  ('{slug}', now() - interval '8 days',  '小林 翼',     'kobayashi.t@example.com',    NULL,            '募集職種B', 'Adobe系全般使えます。',                   'hired',     '入社日調整中',                       'lp_form'),
-  ('{slug}', now() - interval '10 days', '加藤 麻衣',   'kato.mai@example.com',       '080-8901-2345', '募集職種A', '大学時代にインターン経験あり。',           'rejected',  '別候補者を採用',                     'lp_form'),
-  ('{slug}', now() - interval '13 days', '吉田 龍之介', 'yoshida.r@example.com',      '070-9012-3456', '募集職種B', 'フリーランスで採用LPを30本以上制作。',       'hired',     '業務委託契約開始',                   'lp_form'),
-  ('{slug}', now() - interval '16 days', '山本 恵子',   'yamamoto.k@example.com',     '090-0123-4567', '募集職種A', NULL,                                      'seen',      NULL,                                'lp_form'),
-  ('{slug}', now() - interval '19 days', '松本 雄一',   'matsumoto.y@example.com',    '080-1122-3344', '募集職種A', '営業→HR転身希望。',                       'rejected',  'スキルミスマッチ',                   'lp_form'),
-  ('{slug}', now() - interval '23 days', '木村 由美',   'kimura.yumi@example.com',    '070-2233-4455', '募集職種B', '動画編集も可能。',                         'seen',      NULL,                                'lp_form'),
-  ('{slug}', now() - interval '27 days', '林 健一',     'hayashi.k@example.com',      NULL,            '募集職種A', NULL,                                      'new',       NULL,                                'lp_form');
+  ('{slug}', now() - interval '1 hour',  '山田 健太',   'yamada.kenta@example.com',   '090-1234-5678', '募集職種A', '御社のビジョンに共感しました。業界経験3年、新しい挑戦をしたいです。', 'new',       NULL, 'lp_form_demo'),
+  ('{slug}', now() - interval '3 hours', '佐藤 美咲',   'sato.misaki@example.com',    '080-2345-6789', '募集職種B', 'デザイナーとして5年の経験があります。ポートフォリオあります。', 'new',       NULL, 'lp_form_demo'),
+  ('{slug}', now() - interval '8 hours', '鈴木 翔太',   'suzuki.shota@example.com',   '070-3456-7890', '募集職種A', 'HRテックに興味があり、業務の最適化に貢献したいです。', 'seen',      '返信済み。カジュアル面談調整中', 'lp_form_demo'),
+  ('{slug}', now() - interval '1 day',   '田中 愛子',   'tanaka.aiko@example.com',    NULL,            '募集職種B', NULL, 'new', NULL, 'lp_form_demo'),
+  ('{slug}', now() - interval '2 days',  '高橋 大輔',   'takahashi.d@example.com',    '090-4567-8901', '募集職種A', '前職は営業5年。人と関わる仕事が好きです。', 'contacted', '1次面談予定',                      'lp_form_demo'),
+  ('{slug}', now() - interval '3 days',  '伊藤 さくら', 'ito.sakura@example.com',     '080-5678-9012', '募集職種B', 'コピーライティングとUI/UXデザインが得意です。', 'contacted', 'ポートフォリオ確認中',             'lp_form_demo'),
+  ('{slug}', now() - interval '5 days',  '渡辺 達也',   'watanabe.t@example.com',     '070-6789-0123', '募集職種A', '京都在住。スタートアップ経験あり。',     'rejected',  '経験不足',                          'lp_form_demo'),
+  ('{slug}', now() - interval '6 days',  '中村 優奈',   'nakamura.y@example.com',     '090-7890-1234', '募集職種A', '人材紹介会社で3年。個人の成長に寄り添いたい。', 'contacted', '2次面談調整中',            'lp_form_demo'),
+  ('{slug}', now() - interval '8 days',  '小林 翼',     'kobayashi.t@example.com',    NULL,            '募集職種B', 'Adobe系全般使えます。',                   'hired',     '入社日調整中',                       'lp_form_demo'),
+  ('{slug}', now() - interval '10 days', '加藤 麻衣',   'kato.mai@example.com',       '080-8901-2345', '募集職種A', '大学時代にインターン経験あり。',           'rejected',  '別候補者を採用',                     'lp_form_demo'),
+  ('{slug}', now() - interval '13 days', '吉田 龍之介', 'yoshida.r@example.com',      '070-9012-3456', '募集職種B', 'フリーランスで採用LPを30本以上制作。',       'hired',     '業務委託契約開始',                   'lp_form_demo'),
+  ('{slug}', now() - interval '16 days', '山本 恵子',   'yamamoto.k@example.com',     '090-0123-4567', '募集職種A', NULL,                                      'seen',      NULL,                                'lp_form_demo'),
+  ('{slug}', now() - interval '19 days', '松本 雄一',   'matsumoto.y@example.com',    '080-1122-3344', '募集職種A', '営業→HR転身希望。',                       'rejected',  'スキルミスマッチ',                   'lp_form_demo'),
+  ('{slug}', now() - interval '23 days', '木村 由美',   'kimura.yumi@example.com',    '070-2233-4455', '募集職種B', '動画編集も可能。',                         'seen',      NULL,                                'lp_form_demo'),
+  ('{slug}', now() - interval '27 days', '林 健一',     'hayashi.k@example.com',      NULL,            '募集職種A', NULL,                                      'new',       NULL,                                'lp_form_demo');
 
--- Backfill 30 days of page views with growth trend + weekend dips + realistic distribution
+-- Backfill 30 days of page views with growth trend + weekend dips +
+-- realistic referrer mix. The key fix vs the old seed: we use
+-- per-row random() values inside a CTE so PostgreSQL evaluates them
+-- ONCE PER ROW instead of once per statement. With the old subquery
+-- approach (SELECT ... ORDER BY random() LIMIT 1) the optimizer
+-- collapsed the subquery and every row got the same referrer.
+-- Distribution target:
+--   Google検索   ~40%
+--   直接アクセス  ~22%
+--   Twitter/X    ~15%
+--   LinkedIn     ~10%
+--   Bing検索      ~5%
+--   Facebook      ~5%
+--   Instagram     ~3%
 WITH day_series AS (
   SELECT generate_series(0, 29) AS days_ago
 ),
@@ -180,63 +195,66 @@ counts AS (
     )::int AS view_count
   FROM day_series
 ),
-referrer_pool AS (
-  SELECT unnest(ARRAY[
-    'https://www.google.com/search', 'https://www.google.com/search', 'https://www.google.com/search',
-    'https://www.google.com/search', 'https://www.google.com/search',
-    'https://t.co/xyz', 'https://twitter.com/', 'https://twitter.com/',
-    'https://www.bing.com/search',
-    'https://www.linkedin.com/feed/', 'https://www.linkedin.com/feed/',
-    'https://www.facebook.com/',
-    '', '', '', '', ''
-  ]) AS ref
+exploded AS (
+  SELECT c.days_ago, gs.i
+  FROM counts c
+  CROSS JOIN LATERAL generate_series(1, c.view_count) AS gs(i)
 ),
-path_pool AS (
-  SELECT unnest(ARRAY[
-    '/lp/{slug}', '/lp/{slug}', '/lp/{slug}', '/lp/{slug}', '/lp/{slug}',
-    '/lp/{slug}/jobs/0', '/lp/{slug}/jobs/0',
-    '/lp/{slug}/jobs/1'
-  ]) AS p
+with_random AS (
+  SELECT
+    days_ago, i,
+    random() AS r_ref,
+    random() AS r_path,
+    random() AS r_dev
+  FROM exploded
 )
 INSERT INTO public.lp_page_views (lp_slug, viewed_at, session_id, path, referrer, referrer_domain, user_agent, device_type)
 SELECT
-  '{slug}' AS lp_slug,
-  (now() - (c.days_ago || ' days')::interval - (random() * interval '1 day'))::timestamptz AS viewed_at,
-  md5(random()::text || c.days_ago || i)::text AS session_id,
-  (SELECT p FROM path_pool ORDER BY random() LIMIT 1) AS path,
-  (SELECT CASE WHEN ref = '' THEN NULL ELSE ref END FROM referrer_pool ORDER BY random() LIMIT 1) AS referrer,
-  (SELECT CASE
-    WHEN ref = '' THEN NULL
-    WHEN ref LIKE '%google%' THEN 'google.com'
-    WHEN ref LIKE '%twitter%' OR ref LIKE '%t.co%' THEN 'twitter.com'
-    WHEN ref LIKE '%bing%' THEN 'bing.com'
-    WHEN ref LIKE '%linkedin%' THEN 'linkedin.com'
-    WHEN ref LIKE '%facebook%' THEN 'facebook.com'
-    ELSE NULL END FROM referrer_pool ORDER BY random() LIMIT 1) AS referrer_domain,
-  'Mozilla/5.0 (fake-backfill)' AS user_agent,
-  CASE WHEN random() < 0.55 THEN 'mobile' WHEN random() < 0.85 THEN 'desktop' ELSE 'tablet' END AS device_type
-FROM counts c
-CROSS JOIN LATERAL generate_series(1, c.view_count) AS i;
+  '{slug}',
+  (now() - (days_ago || ' days')::interval - (random() * interval '1 day'))::timestamptz,
+  md5(random()::text || days_ago || i)::text,
+  CASE
+    WHEN r_path < 0.60 THEN '/lp/{slug}'
+    WHEN r_path < 0.85 THEN '/lp/{slug}/jobs/0'
+    ELSE '/lp/{slug}/jobs/1'
+  END,
+  -- referrer URL — same r_ref bucket as referrer_domain
+  CASE
+    WHEN r_ref < 0.40 THEN 'https://www.google.com/search?q=' || (ARRAY['採用','求人','京都%20採用','正社員','転職'])[1 + floor(random() * 5)::int]
+    WHEN r_ref < 0.55 THEN 'https://t.co/' || substring(md5(random()::text), 1, 8)
+    WHEN r_ref < 0.65 THEN 'https://www.linkedin.com/feed/'
+    WHEN r_ref < 0.70 THEN 'https://www.bing.com/search'
+    WHEN r_ref < 0.75 THEN 'https://www.facebook.com/'
+    WHEN r_ref < 0.78 THEN 'https://www.instagram.com/'
+    ELSE NULL
+  END,
+  -- referrer_domain — must match the same r_ref bucket
+  CASE
+    WHEN r_ref < 0.40 THEN 'google.com'
+    WHEN r_ref < 0.55 THEN 'twitter.com'
+    WHEN r_ref < 0.65 THEN 'linkedin.com'
+    WHEN r_ref < 0.70 THEN 'bing.com'
+    WHEN r_ref < 0.75 THEN 'facebook.com'
+    WHEN r_ref < 0.78 THEN 'instagram.com'
+    ELSE NULL
+  END,
+  'Mozilla/5.0 (fake-backfill)',
+  CASE
+    WHEN r_dev < 0.55 THEN 'mobile'
+    WHEN r_dev < 0.85 THEN 'desktop'
+    ELSE 'tablet'
+  END
+FROM with_random;
 
 -- Form events for funnel: ~25% of viewers see the form
 INSERT INTO public.lp_form_events (lp_slug, event_type, occurred_at, session_id, path)
-SELECT
-  '{slug}',
-  'form_view',
-  pv.viewed_at + interval '30 seconds',
-  pv.session_id,
-  pv.path
+SELECT '{slug}', 'form_view', pv.viewed_at + interval '30 seconds', pv.session_id, pv.path
 FROM public.lp_page_views pv
 WHERE pv.lp_slug = '{slug}' AND pv.user_agent LIKE '%fake-backfill%' AND random() < 0.25;
 
 -- ~35% of form-viewers start typing
 INSERT INTO public.lp_form_events (lp_slug, event_type, occurred_at, session_id, path)
-SELECT
-  '{slug}',
-  'form_start',
-  fv.occurred_at + interval '15 seconds',
-  fv.session_id,
-  fv.path
+SELECT '{slug}', 'form_start', fv.occurred_at + interval '15 seconds', fv.session_id, fv.path
 FROM public.lp_form_events fv
 WHERE fv.lp_slug = '{slug}'
   AND fv.event_type = 'form_view'
@@ -245,18 +263,22 @@ WHERE fv.lp_slug = '{slug}'
 
 # SQL to delete only the fake-backfill rows (what the client runs to clean up)
 CLEANUP_SQL_TEMPLATE = """
--- Cleanup: remove only the fake demo data for {slug}, keep real entries
+-- Cleanup: remove ONLY the demo seed data for {slug}, leave real data alone.
+-- This is the same SQL that runs automatically inside the OAuth callback +
+-- email fallback transactions when the client claims ownership via /admin?first.
+-- Idempotent — safe to re-run any time.
+DELETE FROM public.lp_form_events
+ WHERE lp_slug = '{slug}'
+   AND session_id IN (
+     SELECT session_id FROM public.lp_page_views
+     WHERE lp_slug = '{slug}' AND user_agent LIKE '%fake-backfill%'
+   );
+
 DELETE FROM public.lp_page_views
  WHERE lp_slug = '{slug}' AND user_agent LIKE '%fake-backfill%';
 
-DELETE FROM public.lp_form_events
- WHERE lp_slug = '{slug}' AND session_id IN (
-   SELECT session_id FROM public.lp_page_views
-   WHERE lp_slug = '{slug}' AND user_agent LIKE '%fake-backfill%'
- );
-
--- For lp_entries, use the dashboard 全削除 button (owner-only) —
--- safer than raw SQL because it respects RLS + audit trail.
+DELETE FROM public.lp_entries
+ WHERE lp_slug = '{slug}' AND source = 'lp_form_demo';
 """
 
 
