@@ -11,7 +11,9 @@ Bootstrap a complete 採用LP for a client from a single reference URL. Target: 
 
 **Speed over perfection. Ship aggressive, refine in editor.**
 
-This skill exists because the per-LP admin editor at `/lp/{slug}/admin` already handles polishing, theme tweaks, content editing, image swaps, and Google Sheets sync. The editor is fast and the user (Jayden) uses it constantly. So this skill's job is **not** to produce a perfect LP — it's to produce a 90%-correct LP in 90 seconds, then hand off to the editor for the last 10%.
+This skill exists because the per-LP admin editor at `/lp/{slug}/admin` already handles polishing, theme tweaks, content editing, image swaps, Google Sheets sync, custom domain attach, analytics dashboard, and PDF export. The editor is fast and the user (Jayden) uses it constantly. So this skill's job is **not** to produce a perfect LP — it's to produce a 90%-correct LP in 90 seconds, seed it with realistic demo data so it looks alive the moment the client opens their dashboard, then hand off to the editor for the last 10%.
+
+As of 2026-04-09 the admin dashboard has been rebuilt as a self-contained Lovable file at `src/app/lp/[slug]/admin/AdminDashboard.tsx` with 5 sections (ダッシュボード / 応募管理 / LP編集 / 管理者 / 設定), real analytics via `lp_page_views` + `lp_form_events` tables, a tracking pixel baked into every public LP page, a dedicated analytics aggregation endpoint, and a two-state LP編集 landing screen. This means a freshly handed-over client sees a populated dashboard with PV trends, traffic sources, conversion funnel, device breakdown, and sample entries — not a blank slate.
 
 Default behavior: scrape aggressively, fill gaps with sensible defaults, ship to editor, refine there. **Do NOT ask for confirmation mid-flow.** Build, hand off, let user fix in editor. The only acceptable interruptions are: missing required inputs (no URL, no client name) or slug collision.
 
@@ -107,6 +109,29 @@ If any check fails, roll back BEFORE reporting success. Don't trust Vercel's "de
 
 If the user provides real employee names, photos, or quotes during a build, confirm before pushing to the public Vercel URL. The LPs are publicly indexable (except admin pages which have `robots: noindex`). Once it's on the internet and crawled, it's on the internet forever.
 
+### 7. NEVER use bare-variable Tailwind v4 shorthand (`w-[--sidebar-width]`)
+
+Tailwind v4 changed how arbitrary CSS variables are parsed. The bare-variable shorthand `w-[--sidebar-width]` that worked in v3 silently produces `width: --sidebar-width` (literal string) in v4, causing the element to collapse to 0 width. The correct syntax is `w-[var(--sidebar-width)]` — explicit `var()` wrapper.
+
+This bit us twice in the same session when porting the Lovable admin dashboard: first the desktop sidebar overlapped the content area (bare shorthand in the shadcn Sidebar component's `collapsible="icon"` branch), then my "fix" to use `collapsible="none"` hid the mobile drawer behind an always-visible 256px sidebar. The root cause was the same bug in 6 different class names inside `shadcn/sidebar.tsx`: `w-[--sidebar-width]` (×4) and `w-[--sidebar-width-icon]` (×2).
+
+**Fix if you ever copy a shadcn sidebar from v3 docs into a v4 project**: run this regex replacement across the file:
+```python
+re.sub(r'\[--sidebar-width\]', '[var(--sidebar-width)]', src)
+re.sub(r'\[--sidebar-width-icon\]', '[var(--sidebar-width-icon)]', src)
+```
+
+**General rule**: inside arbitrary-value brackets, always wrap CSS variables in `var()` explicitly. `w-[var(--x)]`, not `w-[--x]`. Claude should flag any `[--` pattern in Tailwind classes as a red flag during code review. Precedent commit: `780f440`.
+
+### 8. NEVER jump directly into `LpContentEditor` from the admin sidebar
+
+The `LP編集` section MUST be a two-state component: (a) a landing card with overview stats + hero CTA + section list by default, (b) the full `LpContentEditor` component only after the user explicitly clicks `編集を開始`. Direct jumps confuse users — they land in a dense WordPress-style editor with no context, no escape route, no "why am I here".
+
+Additionally, the editor's back button MUST be in the **header-left** (right after the hamburger), styled with the navy/blue color token, labeled `← ダッシュボードに戻る` (not just `× 閉じる`). The `onClose` callback MUST return to the landing screen, NOT to a different section. This gives a clean back-and-forth: landing → editor → landing → any other section.
+
+Any future admin feature that wraps an existing heavy editor component in the sidebar MUST follow the same pattern. The rule is "cards and landing screens are cheap, context is not." Precedent commit: `dc7d513`.
+
+
 ---
 
 ## Trigger
@@ -150,6 +175,8 @@ When the skill completes successfully, Claude returns a single message with:
 4. **Google Sheet URL** — the auto-sync sheet for entries, sitting in Jayden's Google Drive
 5. **Provenance report** — every field labeled `scraped` | `scraped_dl` | `preset` | `default` | `ai_generated` | `fallback_letter` so the user knows what's real vs placeholder
 6. **Polish checklist** — 2-4 specific things Claude recommends touching up manually before sending to the client (e.g. "the data pills are industry-preset defaults, swap in real numbers if you have them", "voices.items uses placeholder names — replace with real employees after they start")
+7. **Analytics status** — confirmation that (a) `lp_page_views` + `lp_form_events` tables exist + are indexed, (b) the tracking pixel is live in production on `/lp/{slug}`, `/lp/{slug}/jobs/*`, `/lp/{slug}/entry`, (c) `/api/lp/{slug}/track` responds 204, (d) the demo seed has been applied (15 entries + ~3,000 PV + ~800 form_view + ~280 form_start over the last 30 days, all marked with `user_agent LIKE '%fake-backfill%'` so the client can bulk-delete in one SQL statement before real traffic starts). The client's dashboard will show populated charts from minute 1 — no "0 PV, 0 entries" empty-shell first impression.
+8. **Demo data cleanup note** — a one-line instruction for the user on how to clear the seeded data when real traffic starts flowing: the dashboard's 全削除 button handles `lp_entries`, and `DELETE FROM lp_page_views WHERE user_agent LIKE '%fake-backfill%' AND lp_slug='{slug}'` handles the rest.
 
 The user's first action after seeing this message should be: open the live URL, glance at the LP, approve → send the `/admin?first` URL to the client via email/Slack/LINE/iMessage. The OG preview will auto-unfurl to "株式会社{client} 採用LP · 初期設定" with the client's own hero image (metadata is generated server-side in `generateMetadata` on the admin page). The client clicks the link, clicks Google sign-in, authorizes, and is done — they land in the dashboard with a brand-new sheet in their Drive, all admin rights, and ownership of the LP. Total time: ~30 seconds from click to working dashboard.
 
@@ -168,6 +195,8 @@ These are already in place as of 2026-04-09. The skill assumes them.
 | `public.lp_content` table | JSONB content blob keyed by `lp_slug` | The rendered LP pulls from this. Has a trigger that auto-inserts into `lp_content_revisions` on UPDATE — every edit is audit-logged, so rollback is possible |
 | `public.lp_admins` table | Who can manage each LP | Insert Jayden as `owner` + `jayden.barnes.cs@gmail.com` as `member` on bootstrap. Stores `google_refresh_token` / `google_access_token` / `google_token_expiry` — this is where sheet sync auth lives |
 | `public.lp_entries` table | Form submissions from applicants | Append-only; bulk-delete button in dashboard for clearing test data |
+| `public.lp_page_views` table | Page view tracking for analytics dashboard | `lp_slug`, `viewed_at`, `session_id`, `path`, `referrer`, `referrer_domain`, `user_agent`, `device_type`, `country`. RLS allows public INSERT (tracking pixel). Indexed on `(lp_slug, viewed_at DESC)` and `(lp_slug, session_id, viewed_at)` for unique-visitor queries |
+| `public.lp_form_events` table | Form lifecycle tracking for conversion funnel | `lp_slug`, `event_type` ∈ {`form_view`, `form_start`, `form_submit`}, `occurred_at`, `session_id`, `path`. RLS allows public INSERT. Form submits are also tracked here in addition to `lp_entries` because the form may fail to insert but we still want to know the user tried |
 | `public.lp_sheet_configs` table | Google Sheet per LP | One row per slug; points at the sheet ID + URL + owner_email. Gets overwritten on client handover to point at a fresh sheet in the client's Drive |
 | `public.lp_content_revisions` | Auto-populated audit log | Populated by a trigger on `lp_content` UPDATE — no manual writes needed |
 | `public.industry_presets` | Welfare items, data pills, hero EN titles for fallback | Row `製造業/default` is the current fallback; eventually add `default/default` + per-industry rows |
@@ -292,12 +321,23 @@ The skill orchestrator is `scripts/bootstrap.py` on the VM at `/home/ubuntu/mgc-
 
     **No code changes needed for this step.** Just include the URL in the handoff message in step 13.
 
+12.7. **Analytics bootstrap + demo seed** (RULE 20 + RULE 21) — run `scripts/analytics_bootstrap.py --slug {slug} --seed-demo` via `Custom Proxy:server_exec`. This script does 4 things:
+
+    1. **Verify analytics infrastructure exists** — checks `lp_page_views` + `lp_form_events` tables, their indexes, and the RLS policies. If any are missing, applies the `lp_analytics_page_views` migration via Supabase MCP.
+    2. **Verify tracking pixel is wired in production** — curls `/lp/{slug}` + `/lp/{slug}/jobs/0` + `/lp/{slug}/entry` and greps for `lp_sid_{slug}` and `track('form_view')`. If any are missing, the nippo-sync build has drifted from the spec — report to user and halt (do NOT try to auto-patch lp-render.ts from the skill, it's owned code).
+    3. **Verify `/api/lp/{slug}/track` endpoint responds 204** by POSTing a `{"event_type":"page_view","session_id":"bootstrap-test","path":"/lp/{slug}"}` payload, then DELETEs the test row from `lp_page_views`.
+    4. **Seed realistic demo data** — 15 entries + ~3,000 page views + ~800 form_views + ~280 form_starts over the last 30 days. All seeded rows are tagged with `user_agent LIKE '%fake-backfill%'` so the client can bulk-delete them with a single SQL in 2 seconds OR ignore them via the 全削除 button. Seeding takes <5 seconds because it's all done with one INSERT ... SELECT generate_series query per table.
+
+    The script is idempotent — if run twice it will skip the migration (tables already exist) and append another 15 entries (realistic for a growing LP, and the client can still bulk-delete). **DO NOT skip this step even if the user said "no test data" — the analytics verification in 12.7.1-12.7.3 is mandatory.** You can skip 12.7.4 (seed) with `--no-seed` flag if the user explicitly opted out.
+
 13. **Hand off** — return to user:
     - Live URL: `https://nippo-sync.vercel.app/lp/{slug}`
     - Admin URL: `https://nippo-sync.vercel.app/lp/{slug}/admin`
     - **First-setup URL for client** (from step 12.5): `https://nippo-sync.vercel.app/lp/{slug}/admin?first` — send this via email/Slack/LINE/iMessage. The OG preview unfurls as "株式会社{client} 採用LP · 初期設定" with the client's hero image. On click → Google sign-in → ~30 seconds later the client is the owner, has a brand-new Google Sheet in their own Drive, and Jayden is demoted to member (tokens preserved so the old sheet is still accessible if needed). The URL is safe to click/preview — only a fully completed OAuth round-trip burns the one-shot lock.
     - Provenance report (which fields are scraped vs preset vs AI, including `logo: scraped|fallback_letter`)
     - Image source breakdown (scraped/enhanced/generated/unsplashed counts)
+    - **Demo data disclosure** — "このダッシュボードは、引き渡し時点で **デモ用のサンプルデータ**（過去30日分の閲覧数、応募者15件）で埋められています。本物のアクセスが流れ始める前に、応募管理の **🗑️ 全削除** ボタンと Supabase の `DELETE FROM lp_page_views WHERE user_agent LIKE '%fake-backfill%' AND lp_slug='{slug}'` でクリアしてください。" (only if 12.7.4 seed ran — skip this line if `--no-seed` was used)
+    - **Analytics verification** — confirm the 4 checks from step 12.7 all passed (tables, pixel, endpoint 204, seed 15+3000+800+280 or whatever the actual counts are)
     - Suggestion: "After polishing, run `/save-preset {industry}` to update the preset"
 
 ---
@@ -385,6 +425,39 @@ This deletes the `lp_admins` owner row + `lp_sheet_configs` row for the slug. `l
 **BUT**: if `lps.handed_over_at` is already set, the ?first URL is burned and only `lp_admins` DELETE + ALSO setting `handed_over_at = NULL` will allow a fresh claim. Be explicit with the user about this emergency override and log why it was needed.
 
 Precedent: commit `65c6992` — endpoint added during Phase 3 debugging after Jayden revoked access during testing.
+
+**RULE 19 — The admin dashboard is a self-contained Lovable file — treat it as owned code, not UI primitives.** `src/app/lp/[slug]/admin/AdminDashboard.tsx` inlines everything: Button, Input, Select, DropdownMenu, Sheet, Sidebar (full shadcn implementation with TooltipProvider/SidebarContext/keyboard shortcut), useIsMobile hook, cn() helper, STATUS_LABELS, all 5 section components, the AdminContext with 20+ state fields + 15+ action callbacks, PDF export helpers, CSV export, and the AdminDashboard wrapper function. It's ~2400 lines and that's fine. Do NOT split it into separate files "for cleanliness" — the whole point of the Lovable pattern is that the dashboard is one self-contained unit that can be regenerated from Lovable, pasted in, and wired through AdminContext without hunting across 40 imports. When a client wants a design refresh, Jayden goes to Lovable, generates a new `Index.tsx`, and we do the same surgical wiring (add `'use client'`, wire props through AdminContext, import LpContentEditor into LpEditSection, find-replace mock data). Splitting would break this workflow. Precedent commits: `dc43c56` (wiring), `dc7d513` (analytics + landing).
+
+**RULE 20 — Real analytics pipeline is now mandatory infrastructure, not an optional feature.** Every new LP bootstrap MUST ensure the tracking pixel is injected, the aggregation endpoint returns valid data, and the client's dashboard shows populated charts from day 1. The stack has 4 parts that MUST all exist and be wired correctly:
+
+1. **Database**: `public.lp_page_views` + `public.lp_form_events` tables (created in migration `lp_analytics_page_views`, apply via Supabase MCP if missing)
+2. **Tracking pixel**: baked into `src/lib/lp-render.ts` (2 `</body>` injections: main LP + job detail) + `src/app/lp/[slug]/entry/route.ts` (1 injection: entry form with full lifecycle — page_view, form_view, form_start, form_submit via monkey-patched `fetch`). The pixel generates `session_id` from `sessionStorage` and fires keepalive POST requests to `/api/lp/{slug}/track` so it survives the page unload for form_submit.
+3. **Tracking endpoint**: `POST /api/lp/[slug]/track` accepts `{event_type, path, session_id, referrer}`, auto-detects device from UA, extracts referrer domain, captures country from `x-vercel-ip-country` header, writes to the appropriate table, always returns 204 (tracking errors must never block the LP). CORS preflight is handled.
+4. **Aggregation endpoint**: `GET /api/lp/[slug]/admin/analytics?days=30` (auth via `lp_admin_<slug>` cookie) returns `{views_by_day, traffic_sources, device_split, funnel, totals}`. Traffic sources are bucketed into Japanese labels (Google検索 / Bing検索 / Twitter/X / LinkedIn / Facebook / Instagram / その他 / 直接アクセス). Timestamps are bucketed in `Asia/Tokyo` timezone. The dashboard's `DashboardSection` auto-loads on mount via `useAdmin().loadAnalytics(30)` and wires the result to recharts AreaChart (PV trend with unique visitors overlay), BarChart (traffic sources), funnel cards with dropoff %, and device split cards.
+
+The skill must never ship a LP where any of these 4 parts is missing. Use `scripts/analytics_bootstrap.py` during bootstrap to verify all 4 exist and seed test data. Precedent commit: `dc7d513`.
+
+**RULE 21 — Seed realistic test data on every new LP bootstrap.** A freshly handed-over dashboard that says "0 PV, 0 entries, no traffic" is a bad first impression — the client sees a broken-looking shell and assumes the product is empty. Instead, seed the dashboard with ~2-4 weeks of realistic demo data so the charts look alive the moment they sign in. The seed should include:
+
+- **15 entries** in `lp_entries` with varied statuses (new/seen/contacted/rejected/hired ratio ~4:3:3:3:2), realistic Japanese names, dates spread across the last 27 days, mix of phones, some with messages and some without, positions matching the openings actually in their `lp_content`, some with internal notes
+- **~3,000 page views** in `lp_page_views` backfilled over 30 days with a growth trend (40→180 views/day), weekend dips (30% less on Sat/Sun), realistic referrer distribution (Google 40%, direct 30%, Twitter 15%, LinkedIn 10%, Bing/other 5%), device split (mobile 55%, desktop 30%, tablet 15%), paths split between main LP (60%) + /jobs/0 (25%) + /jobs/1 (15%)
+- **~800 form_views** in `lp_form_events` (~25% of page viewers see the form — those who scroll past it)
+- **~280 form_starts** (~35% of form_views start typing)
+- The `form_submits` are the 15 `lp_entries` from above, so conversion = ~0.5% which is realistic for a warm LP
+
+**CRUCIAL**: label all seeded rows with `user_agent LIKE '%fake-backfill%'` or a similar marker so the client can bulk-delete them in one SQL statement if they want a clean slate, AND so the dashboard's 全削除 button can filter them out. The skill's bootstrap script MUST also tell the user in the handoff message: "the dashboard is pre-seeded with demo data — use the 全削除 button to clear it before the real traffic starts". Precedent: `dc7d513` cloq seed.
+
+**RULE 22 — LP編集 section MUST be a two-state landing screen, never a direct jump.** See Critical Constraint #8. The landing card shows: hero CTA with 編集を開始 + 公開中のLPを開く buttons, 4-stat quick grid (PV / 応募率 / 応募総数 / 新規応募 — all from real data via useAdmin), 6-tile section overview (ヒーロー/募集職種/福利厚生/会社情報/メンバーの声/FAQ with icons and descriptions), usage tips card explaining the difference between 「変更をプレビュー」 (in-editor, shows unsaved changes) vs 「公開中のLPを開く」 (live site, shows last saved state). The editor component renders only after clicking 編集を開始 and returns to the landing on `← ダッシュボードに戻る`, NOT to a different section. This prevents the "I opened LP編集 and got dropped into a WordPress clone with no context" confusion.
+
+**RULE 23 — `LpContentEditor` header buttons have strict placement and labeling.** There are exactly 3 navigation/preview buttons in the header and they serve different purposes — the user was confused by the old ambiguous labels, so the fix is in the labels, not the placement. As of `dc7d513`:
+
+1. **`← ダッシュボードに戻る`** (header-left, right after hamburger): styled navy/blue (`#2c3338` bg, `#72aee6` text), returns to `LpEditSection` landing via `onClose()`. Guards unsaved changes with confirm.
+2. **`👁 変更をプレビュー`** (header-right, amber): opens in-editor preview modal showing the CURRENT editor state including unsaved changes. Device-switchable (desktop/mobile).
+3. **`🌐 公開中のLPを開く`** (header-right, blue): opens the live public LP in a new tab (`target="_blank"`) showing the last SAVED state, NOT unsaved edits. Corresponds to what the client actually serves right now.
+
+Inside opening cards, the per-card **`編集 →`** buttons (blue, right-aligned, one per job) open the nested OpeningDetailEditor for that specific job's /jobs/N detail page. These are separate from the main 3 header buttons and do not navigate away — they expand a nested form inline.
+
+Never merge or rename these without updating this rule. Confusing labels cost hours of user support because the distinction between "preview with unsaved changes" vs "see the actually-live site" is subtle but important. Precedent commit: `dc7d513`.
 
 ---
 
@@ -534,6 +607,27 @@ These are from `/home/ubuntu/saiyo-lp-skill/SKILL.md`'s "Gotchas & Hard-Won Less
 
 ---
 
+
+### Category 16 — Admin dashboard rebuild (Lovable port + analytics + LP編集 landing)
+
+This category captures the 3-turn session that replaced the old admin dashboard with a Lovable-generated self-contained file, wired real analytics, and fixed the LP編集 direct-jump UX. If you ever need to redo this (e.g. client asks for a visual refresh and brings a new Lovable export), these are the pitfalls.
+
+**H47 — Lovable file uses Tailwind v4-incompatible bare-variable class names.** The exported shadcn Sidebar component used `w-[--sidebar-width]` (bare variable shorthand) in 6 places, which silently collapses to 0 width in Tailwind v4. Symptom: desktop sidebar overlaps content area, mobile drawer eats the entire viewport. **Fix**: regex-replace all `[--sidebar-width]` → `[var(--sidebar-width)]` and `[--sidebar-width-icon]` → `[var(--sidebar-width-icon)]` on paste. Documented in Critical Constraint #7. Precedent: `780f440`.
+
+**H48 — Lovable file uses custom color class names that don't exist in the host project.** The Lovable export referenced `bg-sidebar-bg`, `text-sidebar-fg`, `text-sidebar-active-fg`, `bg-sidebar-active`, `bg-sidebar-hover` — classes that nippo-sync's `globals.css` didn't define (it uses the standard shadcn names `bg-sidebar`, `text-sidebar-foreground`, etc.). **Fix**: either find-replace the class names to match the host project's CSS tokens, OR add aliases to `globals.css` mapping the Lovable names to the standard tokens. I chose the alias approach so the Lovable file stays verbatim and regeneratable. Six aliases added under `@theme inline`: `--color-sidebar-bg`, `--color-sidebar-fg`, `--color-sidebar-active`, `--color-sidebar-active-fg`, `--color-sidebar-hover`, `--color-sidebar-border`. Precedent: commit existed prior to the rebuild session, aliases were already there.
+
+**H49 — The `dc43c56` wire-up commit did NOT add analytics, test data, or the LP編集 landing screen.** Jayden's initial wiring pass (an external commit I didn't make myself) hooked real data for entries/members/settings/Vercel but left: (a) the Dashboard section with hardcoded placeholder `viewsData`/`conversionData`/`sourceData` marked `サンプル`, (b) the LP編集 section as a direct `<LpContentEditor />` render with no landing screen, (c) no analytics tables, endpoint, or tracking pixel anywhere. The client opening the handed-over dashboard would see "0 entries, 0 PV, サンプル charts" — a worse first impression than the old dashboard. **Fix**: the follow-up `dc7d513` commit added (1) `lp_page_views`+`lp_form_events` tables via migration, (2) test data backfill (15 entries + 3,172 PV + 787 form_view + 281 form_start), (3) `POST /api/lp/[slug]/track` tracking endpoint, (4) `GET /api/lp/[slug]/admin/analytics` aggregation endpoint, (5) tracking pixel injection into lp-render.ts (×2 for main+jobs) + entry/route.ts, (6) AdminCtx extension with `analytics`/`loadingAnalytics`/`loadAnalytics()`, (7) DashboardSection rewrite to use real data from context, (8) LpEditSection rewrite as two-state landing. This is why RULE 20 is mandatory now — to prevent another gap between "wired" and "actually working". Precedent: `dc7d513`.
+
+**H50 — Monkey-patching window.fetch is the only reliable way to track form_submit.** The entry form in `src/app/lp/[slug]/entry/route.ts` is rendered as raw HTML from a route.ts handler (not JSX), and the existing submit handler uses a vanilla `fetch('/api/lp-entry', ...)` call with its own error/success handling that we can't cleanly hook. Attempting to wrap the submit button's click listener is fragile (wrong timing, fires before validation, fires on non-submit clicks). The clean solution is to monkey-patch `window.fetch` at pixel-injection time: `var orig = window.fetch; window.fetch = function(url, init){ var p = orig.apply(this, arguments); if (typeof url === 'string' && url.indexOf('/api/lp-entry') !== -1) { p.then(function(r){ if (r && r.ok) track('form_submit'); }); } return p; };`. This fires form_submit ONLY on a real 2xx response from the entry endpoint, never on validation errors or network failures. Precedent: commit `dc7d513` in `src/app/lp/[slug]/entry/route.ts`. Side note: the pixel also needs `keepalive: true` on the tracking fetch so form_submit survives the page navigation that happens right after a successful submit.
+
+**H51 — The `analytics` endpoint must bucket timestamps in `Asia/Tokyo` timezone, not UTC.** First draft used `date_trunc('day', viewed_at)` which produces UTC days. For a Japanese audience viewing a LP at 8 AM JST (= 23:00 UTC previous day), this means views get attributed to "yesterday" in the chart. **Fix**: `date_trunc('day', viewed_at AT TIME ZONE 'Asia/Tokyo')`. Precedent: `dc7d513` in `/api/lp/[slug]/admin/analytics/route.ts`. Generalization: every time-series query that will be shown to a Japanese user MUST be bucketed in JST.
+
+**H52 — `collapsible="none"` breaks mobile even worse than the overlap bug it fixes.** I hit the bare-variable bug (H47) and reached for `collapsible="none"` as a quick fix — this replaces the shadcn Sidebar's fixed positioning with a plain flex layout so the spacer div actually takes up space. But `"none"` also disables the mobile Sheet drawer, so on mobile the sidebar becomes an always-visible 256px column that eats 2/3 of the viewport. **Real fix is fixing the bare-variable bug at the source** (H47). If you find yourself reaching for `collapsible="none"` as a workaround, stop — you're masking the real bug. Precedent: `83f5266` (the wrong fix) → `780f440` (the right fix).
+
+**H53 — `sonner` `<Toaster>` must be mounted once in `src/app/layout.tsx`, not per-page.** The Lovable export uses `toast()` from sonner throughout but doesn't include the `<Toaster>` provider — it assumes the host project has it mounted. nippo-sync already has `<Toaster richColors position="top-right" />` in `src/app/layout.tsx:25` from a previous session, so nothing needed to be added. But if you're porting this pattern to a NEW host project that doesn't have it, add the Toaster to the root layout, not to AdminDashboard — otherwise toasts from other pages won't render. Also: no `import { Toaster }` needed in AdminDashboard.tsx itself; just `import { toast } from 'sonner'` and fire.
+
+---
+
 ## Troubleshooting — quick symptom → cause table
 
 If something goes wrong post-bootstrap, check this list before digging:
@@ -590,6 +684,20 @@ select lp_slug, email, role
 from public.lp_admins a
 where not exists (select 1 from public.lps where slug = a.lp_slug);
 -- Expected: zero rows
+
+-- 6. Analytics tables exist (RULE 20)
+select
+  to_regclass('public.lp_page_views') is not null as page_views_exists,
+  to_regclass('public.lp_form_events') is not null as form_events_exists;
+-- Expected: both true. If either is false, run the migration
+-- `lp_analytics_page_views` (see scripts/analytics_bootstrap.py)
+
+-- 7. Page views index exists (query performance — dashboards will timeout without it)
+select indexname
+from pg_indexes
+where tablename = 'lp_page_views'
+  and indexname in ('idx_lp_page_views_slug_viewed_at', 'idx_lp_page_views_session');
+-- Expected: both rows present
 ```
 
 ### B. Vercel deployment health (3 checks)
@@ -615,6 +723,28 @@ for k in needed:
   print(f'{"✓" if k in envs else "✗"} {k}')
 "
 # Expected: all 6 present
+
+# 4. Tracking pixel is injected into public LP HTML (RULE 20)
+curl -s https://nippo-sync.vercel.app/lp/yamaguchi | grep -c 'lp_sid_yamaguchi'
+# Expected: 1 (pixel on main LP)
+
+curl -s https://nippo-sync.vercel.app/lp/yamaguchi/entry | grep -c "track('form_view')"
+# Expected: 1 (form lifecycle pixel)
+
+# 5. Track endpoint accepts page_view and returns 204
+curl -sX POST https://nippo-sync.vercel.app/api/lp/yamaguchi/track \
+  -H "Content-Type: application/json" \
+  -d '{"event_type":"page_view","path":"/lp/yamaguchi","session_id":"preflight-check","referrer":""}' \
+  -w '\nHTTP %{http_code}\n' | tail -2
+# Expected: HTTP 204
+
+# 6. Analytics endpoint requires auth (expected 401 without cookie)
+curl -s -w '\nHTTP %{http_code}\n' https://nippo-sync.vercel.app/api/lp/yamaguchi/admin/analytics?days=30 | tail -2
+# Expected: {"error":"Unauthorized"} + HTTP 401
+
+# 7. Clean up the preflight test row from Supabase
+# (run via Supabase MCP afterwards:
+#  DELETE FROM public.lp_page_views WHERE session_id = 'preflight-check';)
 ```
 
 ### C. Forbidden path safety (5 checks — Critical Constraint #1)
@@ -687,10 +817,12 @@ mgc-saiyo-lp-bootstrap/
     ├── bootstrap.py               ← orchestrator (entry point)
     ├── crawl_reference.py         ← multi-page crawler → ContentBundle (with logo + dl extraction)
     ├── extract_design.py          ← Aura wrapper with CSS-fallback
-    └── compose_lpcontent.py       ← merges ContentBundle + design tokens + preset → LpContent
+    ├── compose_lpcontent.py       ← merges ContentBundle + design tokens + preset → LpContent
+    ├── image_pipeline.py          ← concept-aware nano-banana-pro-preview generation (folded in 2026-04-09)
+    └── analytics_bootstrap.py     ← analytics tables verification + tracking pixel verification + demo data seed (folded in 2026-04-09, step 12.7)
 ```
 
-**NOT in the repo** (intentionally): no `upsert_lp.py` (we use Supabase MCP `execute_sql` directly from Claude), no `image_pipeline.py` (image enhancement is a follow-up manual step invoking nano-banana-proxy skill + unsplash-photos skill; hasn't been folded into this orchestrator yet).
+**NOT in the repo** (intentionally): no `upsert_lp.py` — we use Supabase MCP `execute_sql` directly from Claude for all DB writes, no wrapper script needed.
 
 ---
 
