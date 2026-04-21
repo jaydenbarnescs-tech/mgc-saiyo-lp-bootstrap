@@ -415,7 +415,86 @@ The Vercel API credentials (`VERCEL_TOKEN`, `VERCEL_PROJECT_ID`, `VERCEL_TEAM_ID
 
 **DO NOT attempt to automate custom domain setup as part of the skill's workflow**, even if the user mentions a specific domain in their prompt. Reasons: (a) only the owner (client, post-handover) should be attaching domains to their LP, (b) DNS changes belong to the client's registrar and aren't something we can touch, (c) the Vercel API call is tied to a session cookie so it can only run post-login. If the user says "set up the domain recruit.cloq.jp", Claude should mention it in the handoff polish checklist as a recommended manual step the client should do from their dashboard.
 
-**RULE 13 — OG metadata is already baked in — never inherit root layout defaults.** Both `lp-render.ts` (main LP + jobs detail page as raw HTML via route.ts) and `app/lp/[slug]/admin/page.tsx` (React page via `generateMetadata`) set explicit `og:title`, `og:description`, `og:site_name`, `og:image`, `twitter:*`, and `<link rel=icon>` tags pulled from `lp_content`. Never add new top-level LP routes without also setting these tags — otherwise they'll inherit the root layout's `'日報シンクロくん'` default and leak legacy branding into link previews. The admin page's generateMetadata also sets `robots: { index: false, follow: false }` so admin URLs never show up in search engines. Verify new routes with `curl $URL | grep og:title` before shipping.
+**RULE 13 — Full SEO stack is already baked into `lp-render.ts` — never re-implement, never inherit root layout defaults.** As of 2026-04-21 every LP rendered by `lp-render.ts` automatically gets the full SEO set below. Do NOT add these manually — they're already there. Adding them again will duplicate tags.
+
+**What's already baked in for every LP (main page + job detail pages):**
+
+| Tag / Element | Details |
+|---|---|
+| `<title>` / `<meta name="description">` | Pulled from `lp_content.meta.title` / `meta.description` |
+| `<link rel="canonical">` | Points to canonical domain (recruitly.jp subdomain if registered, otherwise nippo-sync.vercel.app/lp/{slug}) |
+| Open Graph — 5 tags | `og:type`, `og:url`, `og:title`, `og:description`, `og:site_name`, `og:image` (conditional on hero bg) |
+| Twitter Card — 4 tags | `summary_large_image`, `twitter:title`, `twitter:description`, `twitter:image` |
+| `og:url` | Matches canonical URL — critical for preventing duplicate content between vercel and recruitly.jp |
+| `lang="ja"` | Always set on `<html>` |
+| Organization JSON-LD | Main LP only — `@type: Organization` with `name`, `url`, `logo`, `sameAs` from `lp_content` |
+| JobPosting JSON-LD | Job detail pages (`/jobs/[index]`) only — full schema with salary, location, employment type |
+| BreadcrumbList JSON-LD | Job detail pages only — `採用情報 → {job title}` with correct canonical URLs |
+| `<link rel="icon">` | Conditional on `lp_content.header.logo_image` |
+
+**What's baked in at the app level (not per-render):**
+- `robots.txt` at `/public/robots.txt` — allows `/lp/*`, disallows `/lp/*/admin`, `/lp/*/entry`, `/lp/*/privacy`, `/dashboard`, `/api/*`
+- `sitemap.xml` at `src/app/sitemap.ts` — dynamic, queries all published LPs from Supabase, includes main LP + all job detail pages with canonical URLs
+- Admin pages: `robots: { index: false, follow: false }` via `generateMetadata()` in `app/lp/[slug]/admin/page.tsx`
+
+**Never add new top-level LP routes** without also setting explicit OG + canonical tags — otherwise they'll inherit the root layout's `'日報シンクロくん'` default. Verify with `curl $URL | grep og:title` before shipping.
+
+**RULE 15 — recruitly.jp subdomain deployment: timing, process, and required code changes.**
+
+MGC hosts client LPs under `{slug}.recruitly.jp` (e.g. `cloq.recruitly.jp`). This is separate from the client's own custom domain flow (RULE 12) — recruitly.jp is MGC's own domain used as a professional branded URL before (or instead of) the client setting up their own domain.
+
+**When to deploy:** Only after the client has confirmed the LP is ready to go live. Do NOT set up the subdomain speculatively during bootstrap — the vercel URL (`nippo-sync.vercel.app/lp/{slug}`) is sufficient for review and iteration.
+
+**Who creates the DNS record:** Currently Jayden asks 松尾さん to add the CNAME at recruitly.jp's DNS provider (muubuu). In future Jayden will have direct access to muubuu to do this himself. The record needed is:
+```
+{slug}.recruitly.jp  CNAME  cname.vercel-dns.com
+```
+
+**Code changes required in nippo-sync (2 files, then git push):**
+
+1. **`src/lib/lp-domains.ts`** — add the slug → canonical domain mapping:
+```typescript
+const CUSTOM_DOMAINS: Record<string, string> = {
+  cloq: 'https://cloq.recruitly.jp',
+  {slug}: 'https://{slug}.recruitly.jp',  // ← add this
+}
+```
+This makes all canonical URLs, `og:url`, Organization JSON-LD, Breadcrumb JSON-LD, and internal links (job cards, nav, CTA buttons) automatically point to the recruitly.jp domain instead of the vercel URL.
+
+2. **`src/middleware.ts`** — add routing for the new subdomain so requests to `{slug}.recruitly.jp` are rewritten to `/lp/{slug}`:
+```typescript
+if (host === '{slug}.recruitly.jp') {
+  if (pathname.startsWith('/_next/') || pathname.startsWith('/api/')) {
+    return NextResponse.next()
+  }
+  const mapped =
+    pathname === '/' || pathname === ''  ? '/lp/{slug}'
+    : pathname === '/admin'             ? '/lp/{slug}/admin'
+    : pathname === '/privacy'           ? '/lp/{slug}/privacy'
+    : pathname === '/entry'             ? '/lp/{slug}/entry'
+    : pathname.startsWith('/jobs/')     ? `/lp/{slug}${pathname}`
+    : null
+  if (mapped) {
+    const url = req.nextUrl.clone()
+    url.pathname = mapped
+    return NextResponse.rewrite(url)
+  }
+  return new NextResponse(BRANDED_404_HTML, { status: 404, headers: { 'content-type': 'text/html; charset=utf-8' } })
+}
+```
+(Copy the cloq block as a template and swap `cloq` → `{slug}`. Also create a branded 404 HTML constant for the new client matching their brand colors.)
+
+3. **Vercel domain registration** — after pushing the code, register the domain in Vercel so it routes correctly. The domain-attach endpoint at `POST /api/lp/{slug}/admin/domain-attach` handles this, OR do it manually via the Vercel dashboard under the nippo-sync project → Domains → Add.
+
+**Full checklist:**
+1. ✅ Client confirms LP is ready
+2. ✅ Ask 松尾さん (or use muubuu directly when access granted) to add CNAME: `{slug}.recruitly.jp → cname.vercel-dns.com`
+3. ✅ Update `src/lib/lp-domains.ts` — add slug → domain entry
+4. ✅ Update `src/middleware.ts` — add routing block for new subdomain
+5. ✅ `git push origin main` → Vercel auto-deploys
+6. ✅ Register domain in Vercel (dashboard or domain-attach API)
+7. ✅ Wait for DNS propagation (5–30 min typical)
+8. ✅ Verify: `curl -sI https://{slug}.recruitly.jp` → HTTP 200, then `curl -s https://{slug}.recruitly.jp | grep canonical` → should show `https://{slug}.recruitly.jp`
 
 **RULE 14 — Images should be 融合 of original style + generated content, NOT reused homepage photos.** The cloq build violated this on first pass — I grabbed images from cloq.jp's existing pages and stuck them on the 採用LP as-is. That's lazy and produces a LP that looks like a 切り貼り (cut-and-paste) of the client's existing site. The correct approach:
 
