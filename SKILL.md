@@ -7,6 +7,29 @@ description: Creates a brand-new Japanese 採用LP (recruitment landing page) fo
 
 Bootstrap a complete 採用LP for a client from a single reference URL. Target: under 2 minutes from prompt to live URL.
 
+---
+
+## WHERE IS EVERYTHING — orientation map
+
+This product is split across local workspace paths and production services. Always check here before searching.
+
+| What | Path | Notes |
+|---|---|---|
+| **This skill and bootstrap runtime** | `~/.claude/skills/mgc-saiyo-lp-bootstrap/` | Laptop-local source of truth. Run `scripts/bootstrap.py`, `scripts/lpjson.py`, and validators from this directory. |
+| **Live Next.js app — THE SOURCE OF TRUTH** | `~/Developer/nippo-sync-local/` (clone of GitHub `jaydenbarnescs-tech/nippo-sync`, branch `main`) | Mac local. The ONLY authoritative LP code — this is literally what Vercel builds and deploys. Run `git fetch origin && git status` before editing so you're working from `origin/main`, not stale local drift. The old `template/` snapshot is **deprecated** — do NOT read or edit it as a baseline (see RULE 24). |
+| **CLOQ client project** | `~/Documents/Work/Clients/CLOQ/` | First client ever built. Has blueprints, site HTML, reference images, contracts. Use as the reference for what a finished LP looks like. |
+| **Production** | `https://nippo-sync.vercel.app` | Auto-deploys from nippo-sync GitHub pushes. LPs at `/lp/{slug}`, admin at `/lp/{slug}/admin`. |
+| **Database** | Supabase project `pglaffdnhixmabcjdxbi` | Tables: `public.lps`, `public.lp_content`, `public.lp_admins`, `public.lp_page_views`, `public.lp_form_events`. |
+
+**What to edit where:**
+- New client LP → trigger this skill
+- Change bootstrap logic → edit `scripts/` in this laptop-local skill folder
+- Change LP frontend (layout, admin UI, SEO) → `git fetch origin` then edit `~/Developer/nippo-sync-local/src/`, commit + push to `main` → Vercel auto-deploys. (No `template/` to re-sync — it's retired.)
+- Polish a live LP → `/lp/{slug}/admin`
+- Reference docs → `docs/` in this folder (seo.md, architecture.md, deploy.md, custom-domains.md, indexing-api.md)
+
+---
+
 ## THE ONE RULE — read this first, every time
 
 **Speed over perfection. Ship aggressive, refine in editor.**
@@ -27,7 +50,7 @@ These are non-negotiable. They come from hard lessons in the predecessor `saiyo-
 
 ### 1. NEVER touch Matsuo-san's services or directories
 
-The Oracle Cloud VM runs multiple services in parallel. Some are Matsuo-san's (completely separate product, different codebase, different clients). Writing to any of these paths WILL break production for Matsuo-san's team and is treated as a severity-1 incident.
+This bootstrap runs laptop-local. Only apply this section if a separate task explicitly requires operating the shared server. The server runs multiple services in parallel, and some are Matsuo-san's (completely separate product, different codebase, different clients). Writing to those paths WILL break production for Matsuo-san's team and is treated as a severity-1 incident.
 
 **Forbidden paths** (read-only at most, never write, never restart, never `git pull`):
 - `/home/ubuntu/mgc-connector-hub/` — Matsuo-san's connector hub
@@ -41,7 +64,6 @@ The Oracle Cloud VM runs multiple services in parallel. Some are Matsuo-san's (c
 
 **Jayden's paths (safe to write)**:
 - `/home/ubuntu/nippo-sync/` — Jayden's nippo-sync repo
-- `/home/ubuntu/mgc-saiyo-lp-bootstrap/` — this skill
 - `/home/ubuntu/mgc-pass-proxy/` — the MGC proxy server
 - `/home/ubuntu/mgc-research-agent/`, `/home/ubuntu/mgc-docs/`, `/home/ubuntu/mgc-accelerator-hub/`, `/home/ubuntu/mgc-translation-*/`
 
@@ -215,7 +237,7 @@ These are already in place as of 2026-04-09. The skill assumes them.
 | Supabase project | `pglaffdnhixmabcjdxbi` (`nippo-sync`) | Single source of truth for all LP data |
 | `public.lps` table | Master registry — one row per LP | `slug` PK, `client_name`, `status`, `reference_url`, `custom_domain`, `handed_over_at` (one-shot lock), `handed_over_by_email`, `domain_last_status`, `domain_last_checked_at`, `domain_last_error`, `created_via='skill'` |
 | `public.lp_content` table | JSONB content blob keyed by `lp_slug` | The rendered LP pulls from this. Has a trigger that auto-inserts into `lp_content_revisions` on UPDATE — every edit is audit-logged, so rollback is possible |
-| `public.lp_admins` table | Who can manage each LP | Insert Jayden as `owner` + `jayden.barnes.cs@gmail.com` as `member` on bootstrap. Stores `google_refresh_token` / `google_access_token` / `google_token_expiry` — this is where sheet sync auth lives |
+| `public.lp_admins` table | Who can manage each LP | Seed the FULL standard team on bootstrap (step 10.3) — `STANDARD_TEAM_ADMINS` in `scripts/lp_manifest_schema.py` (5 emails: `jayden.barnes@mgc-global01.com` owner + `jayden.barnes.cs@gmail.com`, `gussan207@gmail.com`, `terada-h@cloq.jp`, `yamaguchi-h@cloq.jp` as members). Stores `google_refresh_token` / `google_access_token` / `google_token_expiry` — this is where sheet sync auth lives |
 | `public.lp_entries` table | Form submissions from applicants | Append-only; bulk-delete button in dashboard for clearing test data |
 | `public.lp_page_views` table | Page view tracking for analytics dashboard | `lp_slug`, `viewed_at`, `session_id`, `path`, `referrer`, `referrer_domain`, `user_agent`, `device_type`, `country`. RLS allows public INSERT (tracking pixel). Indexed on `(lp_slug, viewed_at DESC)` and `(lp_slug, session_id, viewed_at)` for unique-visitor queries |
 | `public.lp_form_events` table | Form lifecycle tracking for conversion funnel | `lp_slug`, `event_type` ∈ {`form_view`, `form_start`, `form_submit`}, `occurred_at`, `session_id`, `path`. RLS allows public INSERT. Form submits are also tracked here in addition to `lp_entries` because the form may fail to insert but we still want to know the user tried |
@@ -233,7 +255,7 @@ These are already in place as of 2026-04-09. The skill assumes them.
 
 ## Workflow — single shot, no checkpoints, target <2min
 
-The skill orchestrator is `scripts/bootstrap.py` on the VM at `/home/ubuntu/mgc-saiyo-lp-bootstrap/`. Claude invokes it via `Custom Proxy:server_exec` with the parsed args.
+The skill orchestrator is `scripts/bootstrap.py` in the laptop-local skill folder: `~/.claude/skills/mgc-saiyo-lp-bootstrap/`. Agents should run it from that directory with local shell commands.
 
 1. **Parse intent** from user message → `{client_name, primary_url, style_url?, industry_hint?}`
 2. **Resolve slug** — kebab-case from client name (strip 株式会社, 有限会社, スペース, etc.), validate `^[a-z0-9-]{1,64}$`, abort with clear error if collision in `lps` table (unless user said "overwrite")
@@ -277,6 +299,12 @@ The skill orchestrator is `scripts/bootstrap.py` on the VM at `/home/ubuntu/mgc-
    - `header.logo_image` ← bundle.logo_url (real company logo extracted by `extract_logo()` — WordPress custom-logo class, brand-link <img>, header <img> with matching alt, favicon fallback). When present, the renderer shows the actual logo image in the header; `logo_letter` remains as a graceful fallback
    - `theme.primary/accent/accent2` ← Aura or CSS fallback (from extract_design.py)
    - `footer.address` ← scraped via 〒 regex
+   - `map.region`, `map.locality`, `map.street`, `map.postal_code` ← parsed from `footer.address` immediately after scraping. **This is required for Google Jobs indexing** — without it, `JobPosting.jobLocation.address` only has `addressCountry: "JP"` and Google will not surface the job. Parse rule for Japanese address `〒NNN-NNNN 都道府県市区町村番地`:
+     1. `postal_code` ← digits after `〒`, e.g. `"614-8142"`
+     2. `region` ← the 都道府県 token (ends with `都|道|府|県`), e.g. `"京都府"`
+     3. `locality` ← the 市区町村 token (ends with `市|区|町|村`) immediately after region, e.g. `"八幡市"`
+     4. `street` ← everything that follows locality, e.g. `"下奈良南頭14"` (strip trailing `（…）` clauses like `（転勤なし）`)
+     If parsing fails (unusual address format), set all four to `""` and log in provenance — **do not leave `map` as null**.
    - `footer.founded` ← bundle.founded (extracted from 設立 / 創業 in 会社概要 dl)
    - `footer.representative` ← bundle.representative (extracted from 代表者 / 代表取締役 in 会社概要 dl)
    - `footer.business` ← bundle.business_type (主な事業内容 in 会社概要 dl)
@@ -290,9 +318,9 @@ The skill orchestrator is `scripts/bootstrap.py` on the VM at `/home/ubuntu/mgc-
    - `cta.headline`, `cta.sub`
 
    **Fields with placeholders** (flagged for user polish in admin editor):
-   - `voices.items` ← single placeholder; real photos via follow-up nano-banana step
+   - `voices.items` ← single placeholder; final photos via codex-imagegen-first generated assets
    - `data.items` ← industry preset defaults
-   - `map_embed_src` ← empty
+   - `map_embed_src` ← empty (map structured fields are auto-populated above; only the iframe src needs manual entry)
 
 8.5. **Audience pivot review** — THIS IS THE STEP YOU CANNOT SKIP. Read the composer output and rewrite the audience-sensitive sections (hero, about, strengths, cta) BEFORE inserting into Supabase. See RULE 9 for the full rationale, but the short version:
 
@@ -307,7 +335,19 @@ The skill orchestrator is `scripts/bootstrap.py` on the VM at `/home/ubuntu/mgc-
 10. **Insert via Supabase MCP** (single transaction preferred) — use `Supabase:execute_sql` against project `pglaffdnhixmabcjdxbi`:
     1. `INSERT INTO public.lps` if not already done in step 3
     2. `INSERT INTO public.lp_content (lp_slug, content, published) VALUES (...)` with the AUDIENCE-REVIEWED LpContent as a `$LPCONTENT$...$LPCONTENT$::jsonb` dollar-quoted literal (avoids escaping the Japanese + nested quotes mess)
-    3. `INSERT INTO public.lp_admins (lp_slug, email, role)` for `jayden.barnes@mgc-global01.com` as `owner` AND `jayden.barnes.cs@gmail.com` as `member`. Without this row the `/lp/{slug}/admin` page treats the LP as nonexistent (the `fetchCompanyAndExists` function checks lp_admins as one of the existence signals).
+    3. **Seed the FULL standard MGC team into `public.lp_admins` — ALWAYS, no matter what `setup.admin_seed` says.** The single source of truth is `STANDARD_TEAM_ADMINS` in `scripts/lp_manifest_schema.py` (currently 5 emails; `kokomu.matsuo@mgc-global01.com` is intentionally excluded — confirmed 2026-05-18). Run this exact idempotent upsert (it re-asserts roles on re-runs and never wipes Google tokens):
+
+```sql
+INSERT INTO public.lp_admins (lp_slug, email, role, invited_by, invite_status) VALUES
+  ('{slug}', 'jayden.barnes@mgc-global01.com', 'owner',  'standard-team-seed', 'active'),
+  ('{slug}', 'jayden.barnes.cs@gmail.com',     'member', 'standard-team-seed', 'active'),
+  ('{slug}', 'gussan207@gmail.com',            'member', 'standard-team-seed', 'active'),
+  ('{slug}', 'terada-h@cloq.jp',               'member', 'standard-team-seed', 'active'),
+  ('{slug}', 'yamaguchi-h@cloq.jp',            'member', 'standard-team-seed', 'active')
+ON CONFLICT (lp_slug, email) DO UPDATE SET role = EXCLUDED.role, invite_status = 'active', updated_at = now();
+```
+
+If a manifest's `setup.admin_seed` lists extra client emails, add them as additional `'member'` rows in the same statement — but the 5 standard rows above are mandatory and their roles always win (exactly one `owner` = `jayden.barnes@mgc-global01.com`). Do NOT reduce this to just 2 emails. Without at least one `lp_admins` row the `/lp/{slug}/admin` page treats the LP as nonexistent (`fetchCompanyAndExists` checks lp_admins as an existence signal). To regenerate the SQL programmatically: `python3 -c "from scripts.lp_manifest_schema import standard_team_rows; print(standard_team_rows('{slug}'))"`.
     4. `UPDATE public.lps SET status = 'live' WHERE slug = '{slug}'`
 
 10.5. **Create Google Sheet for entries auto-sync — BEST-EFFORT, not required** — read Jayden's existing Google OAuth tokens from `lp_admins` and try to create an initial sheet in Jayden's Drive. This gives Jayden a sheet to watch for any test entries between bootstrap and the client's handover — but it's **intentionally replaced** by a fresh sheet in the client's own Drive when they claim ownership via `/admin?first` (see step 12.5). So if this step fails for any reason (Jayden hasn't re-OAuthed recently, Google API 503, scope issue, quota), **continue the bootstrap anyway and log it in provenance as `sheet_initial: "failed"`**. The client will create their own sheet on handover regardless.
@@ -343,7 +383,7 @@ The skill orchestrator is `scripts/bootstrap.py` on the VM at `/home/ubuntu/mgc-
 
     **No code changes needed for this step.** Just include the URL in the handoff message in step 13.
 
-12.7. **Analytics bootstrap + demo seed** (RULE 20 + RULE 21) — run `scripts/analytics_bootstrap.py --slug {slug} --seed-demo` via `Custom Proxy:server_exec`. This script does 4 things:
+12.7. **Analytics bootstrap + demo seed** (RULE 20 + RULE 21) — run `python3 scripts/analytics_bootstrap.py --slug {slug} --seed-demo` from the laptop-local skill folder. This script does 4 things:
 
     1. **Verify analytics infrastructure exists** — checks `lp_page_views` + `lp_form_events` tables, their indexes, and the RLS policies. If any are missing, applies the `lp_analytics_page_views` migration via Supabase MCP.
     2. **Verify tracking pixel is wired in production** — curls `/lp/{slug}` + `/lp/{slug}/jobs/0` + `/lp/{slug}/entry` and greps for `lp_sid_{slug}` and `track('form_view')`. If any are missing, the nippo-sync build has drifted from the spec — report to user and halt (do NOT try to auto-patch lp-render.ts from the skill, it's owned code).
@@ -368,13 +408,13 @@ The skill orchestrator is `scripts/bootstrap.py` on the VM at `/home/ubuntu/mgc-
 
 | Slot | Primary | Fallback 1 | Fallback 2 |
 |---|---|---|---|
-| `hero.bg_image` | Best scraped client photo → nano-banana enhance to 16:9 cinematic recruitment vibe | Scraped photo as-is | nano-banana fresh generate |
-| `about.photo` | Scraped client about/company photo → nano-banana light enhance | Scraped as-is | nano-banana fresh |
-| `voices[].photo` × 3 | Scraped staff photos → nano-banana enhance for consistency | nano-banana fresh generate (consistent style across all 3) | Unsplash (last resort) |
-| `openings[].image` × N | Scraped client workplace photos → nano-banana enhance per job context | nano-banana fresh | Unsplash (last resort) |
-| Decoratives (textures, dividers, news thumbs) | Unsplash | — | — |
+| `hero.bg_image` | Codex generated image from company profile + approved references | Regenerate with revised prompt | Abort handoff until generated |
+| `about.photo` | Codex generated company-overview/workplace image | Regenerate with revised prompt | Abort handoff until generated |
+| `voices[].photo` × 3 | Codex generated fictional employee placeholders unless client-provided consented photos exist | Regenerate with consistent uniform/style | Abort handoff until generated |
+| `openings[].image` × N | Codex generated per-role image based on 職種 + business line + approved references | Regenerate with role-specific prompt | Abort handoff until generated |
+| Decoratives (textures, dividers, news thumbs) | CSS or generated assets only | — | Do not pull random stock/Unsplash into final LP |
 
-**All final image URLs MUST point to the lp-assets Supabase Storage bucket.** Upload everything (scraped, enhanced, generated, unsplashed) into `lp-assets/{slug}/...` and write `lp_assets` pointer rows. We own our assets.
+**All final body/job/voice image URLs MUST point to approved generated assets.** Source/downloaded images stay in `media_research.source_images` as references. Logos/icons may be direct official-site assets; everything else must be generated, uploaded to the approved public asset path, recorded in `image_generation.generated_assets`, and approved before apply.
 
 ---
 
@@ -390,7 +430,7 @@ The skill orchestrator is `scripts/bootstrap.py` on the VM at `/home/ubuntu/mgc-
 
 **RULE 5 — Every AI-generated field is logged** in the provenance report. User must always know what's hallucinated and what's real.
 
-**RULE 6 — Images SHOULD go through lp-assets bucket (v1 goal).** The long-term target is that every image in `lp_content` is hosted on the `lp-assets` Supabase Storage bucket so we own our assets. For v0, raw scraped URLs from the client's site are acceptable as long as they're flagged in provenance — image migration runs as a follow-up step after the LP is verified live.
+**RULE 6 — Final LP body/job/voice images MUST be generated assets.** Raw scraped URLs from the client's site, Google Images, Unsplash, or downloaded local files are not acceptable final `lp_content` images. They are reference inputs only. `validate_lp_json.py --for-apply` and `/api/admin/lp-bootstrap-import` block apply until required image slots point to approved generated assets. The only direct-use exceptions are official logos/favicons in `header.logo_image` / `header.favicon_url`.
 
 **RULE 7 — Industry preset auto-update is OPT-IN.** After polishing, the system suggests "save these as the new {industry} default preset?" but never auto-saves.
 
@@ -423,21 +463,80 @@ The Vercel API credentials (`VERCEL_TOKEN`, `VERCEL_PROJECT_ID`, `VERCEL_TEAM_ID
 |---|---|
 | `<title>` / `<meta name="description">` | Pulled from `lp_content.meta.title` / `meta.description` |
 | `<link rel="canonical">` | Points to canonical domain (recruitly.jp subdomain if registered, otherwise nippo-sync.vercel.app/lp/{slug}) |
+| `<meta name="robots" content="max-image-preview:large,max-snippet:-1,max-video-preview:-1">` | Tells Google's snippet engine to use the largest available image preview and unbounded text snippets in search results. Free win, no downside. |
 | Open Graph — 5 tags | `og:type`, `og:url`, `og:title`, `og:description`, `og:site_name`, `og:image` (conditional on hero bg) |
 | Twitter Card — 4 tags | `summary_large_image`, `twitter:title`, `twitter:description`, `twitter:image` |
 | `og:url` | Matches canonical URL — critical for preventing duplicate content between vercel and recruitly.jp |
 | `lang="ja"` | Always set on `<html>` |
+| `google-site-verification` meta | One `<meta>` tag per token in `CustomDomainConfig.googleSiteVerification` (accepts `string \| string[]`). Multiple owners (client + MGC team + service account) can each verify independently — GSC supports unlimited concurrent verifications per property. |
 | Organization JSON-LD | Main LP only — `@type: Organization` with `name`, `url`, `logo`, `sameAs` from `lp_content` |
-| JobPosting JSON-LD | Job detail pages (`/jobs/[index]`) only — full schema with salary, location, employment type |
+| JobPosting JSON-LD | Job detail pages (`/jobs/[index]`) only. Full schema including: salary, location, employment type, `identifier` (`{slug}-{jobIndex}` — stable dedup ID), `directApply: true` (unlocks Google for Jobs badge, ranking signal since 2024), `validThrough` (admin-set or auto-defaulted to `posted_date + 90 days` — prevents Google for Jobs dropping listings after 30 days) |
 | BreadcrumbList JSON-LD | Job detail pages only — `採用情報 → {job title}` with correct canonical URLs |
 | `<link rel="icon">` | Conditional on `lp_content.header.logo_image` |
 
+**LP page inventory — every slug gets all of these automatically:**
+
+| Route | File | Notes |
+|---|---|---|
+| `/lp/{slug}` | `app/lp/[slug]/route.ts` | Main LP, reads `lp_content` from DB |
+| `/lp/{slug}/entry` | `app/lp/[slug]/entry/route.ts` | Application form. Consent checkbox links to both `/privacy` and `/terms` |
+| `/lp/{slug}/privacy` | `app/lp/[slug]/privacy/route.ts` | 個人情報の取扱いについて — auto-filled from `lp_content` (company name, address, rep, website) |
+| `/lp/{slug}/terms` | `app/lp/[slug]/terms/route.ts` | 利用規約 — auto-filled from `lp_content`. Both pages are `noindex` and linked from every LP footer |
+| `/lp/{slug}/jobs/[index]` | `app/lp/[slug]/jobs/[index]/route.ts` | Individual job detail pages |
+| `/lp/{slug}/admin` | `app/lp/[slug]/admin/page.tsx` | Admin dashboard (noindex) |
+| `/lp/{slug}/robots.txt` | `app/lp/[slug]/robots.txt/route.ts` | Per-LP robots |
+| `/lp/{slug}/sitemap-xml` | `app/lp/[slug]/sitemap-xml/route.ts` | Per-LP sitemap |
+
 **What's baked in at the app level (not per-render):**
-- `robots.txt` at `/public/robots.txt` — allows `/lp/*`, disallows `/lp/*/admin`, `/lp/*/entry`, `/lp/*/privacy`, `/dashboard`, `/api/*`
-- `sitemap.xml` at `src/app/sitemap.ts` — dynamic, queries all published LPs from Supabase, includes main LP + all job detail pages with canonical URLs
+- Per-LP `robots.txt` at `/lp/{slug}/robots.txt` — allows `/`, disallows `/admin /entry /privacy /terms`, includes `Sitemap:` pointer
+- Per-LP `sitemap.xml` at `/lp/{slug}/sitemap-xml` — root + all `/jobs/N` with `lastmod` from `lp_content.updated_at` (not always-today, so Google sees real change dates)
+- Top-level `sitemap.ts` — aggregates all published LPs with `lastModified` from `updated_at`
 - Admin pages: `robots: { index: false, follow: false }` via `generateMetadata()` in `app/lp/[slug]/admin/page.tsx`
+- **Google Indexing API auto-ping** — on every content save (`PUT /api/lp/{slug}/admin/content` or `POST /api/admin/lp-content-upsert`), the system automatically calls the Google Indexing API for every `/jobs/N` URL. This fast-tracks crawling from days/weeks to hours — JobPosting URLs are specifically eligible for this API. Requires the MGC service account to be an **Owner** in GSC for the domain (see RULE 16).
 
 **Never add new top-level LP routes** without also setting explicit OG + canonical tags — otherwise they'll inherit the root layout's `'日報シンクロくん'` default. Verify with `curl $URL | grep og:title` before shipping.
+
+**Where the SEO code actually lives (for debugging, editing, or adding to it):**
+
+| File | Role |
+|---|---|
+| `src/lib/lp-render.ts` | The HTML renderer. All `<head>` meta tags, JSON-LD blocks, and robots meta live here. Two render functions: `renderLpHtml()` (root LP) and `renderJobDetailHtml()` (job detail). Both share the same helpers. |
+| `src/lib/lp-domains.ts` | Single source of truth for custom domains. `CUSTOM_DOMAINS` map → `CustomDomainConfig` (host, brandName, brandColor, `googleSiteVerification: string \| string[]`). `getGoogleVerificationTokens(slug)` normalises the field to an array and is called by the renderer. `getLpCanonicalBase(slug)` drives all canonical URLs everywhere. |
+| `src/lib/google-indexing.ts` | Google Indexing API client. `notifyIndexingApiForLp({slug, openingsCount, published})` — fires `URL_UPDATED` for every `/jobs/N` via service account JWT. Fire-and-forget, never throws. |
+| `src/app/api/lp/[slug]/admin/content/route.ts` | Admin editor save (`PUT`). Calls `notifyIndexingApiForLp` after every successful upsert. |
+| `src/app/api/admin/lp-content-upsert/route.ts` | Bootstrap upsert (`POST`, auth via `x-migration-secret`). Also calls `notifyIndexingApiForLp` — so new LPs created by the skill get auto-pinged immediately. |
+| `src/app/lp/[slug]/sitemap-xml/route.ts` | Per-LP sitemap. Reads `updated_at` from `lp_content` for `<lastmod>` — stable between saves, refreshes only when content changes. |
+| `src/app/sitemap.ts` | Top-level sitemap aggregating all published LPs with `lastModified` from `updated_at`. |
+| `src/app/lp/[slug]/robots.txt/route.ts` | Per-LP robots.txt with sitemap pointer to the canonical domain. |
+
+**Which admin editor fields map to SEO outputs:**
+
+| Admin field (in `LpContent.openings.items[i].detail`) | SEO output |
+|---|---|
+| `detail.posted_date` | `JobPosting.datePosted` (REQUIRED by schema.org — must be set at bootstrap) |
+| `detail.valid_through` | `JobPosting.validThrough` (admin-set). If blank, auto-defaults to `posted_date + 90 days` so Google for Jobs doesn't drop the listing after 30 days. |
+| `detail.employment_type` | `JobPosting.employmentType` (e.g. `FULL_TIME`) |
+| `detail.salary_min` / `detail.salary_max` | `JobPosting.baseSalary` min/max range |
+| `detail.salary_amount` | `JobPosting.baseSalary` single value (fallback when no range) |
+| `lp_content.meta.title` / `meta.description` | `<title>` + `<meta name="description">` on root LP |
+| `lp_content.header.company_name` | `JobPosting.hiringOrganization.name` + `Organization.name` |
+| `lp_content.footer.website` | `Organization.sameAs` + `hiringOrganization.sameAs` |
+| `lp_content.map.region/locality/street/postal_code` | `JobPosting.jobLocation.address` |
+
+**Auto-generated SEO fields (not editable, always correct):**
+- `JobPosting.identifier` = `{ "@type": "PropertyValue", name: companyName, value: "{slug}-{jobIndex}" }` — stable dedup ID, generated at render time
+- `JobPosting.directApply` = `true` — always set because entry form is on the same domain
+- `BreadcrumbList` — generated at render time from slug + job title
+- All canonical URLs — derived from `getLpCanonicalBase(slug)` in lp-domains.ts
+
+**The save → index pipeline in plain English:**
+1. Admin (or skill bootstrap) saves LP content
+2. `notifyIndexingApiForLp()` fires for every `/jobs/N`
+3. Google Indexing API receives `URL_UPDATED` notification — fast-tracks to crawl queue
+4. Google crawls within hours, finds `JobPosting` JSON-LD with `directApply`, `identifier`, `validThrough`
+5. Pages appear in Google search + Google for Jobs within hours instead of weeks
+
+Check Vercel logs for `[indexing] slug={slug} urls=N ok=N failed=0 skipped=false` to confirm each ping succeeded.
 
 **RULE 15 — recruitly.jp subdomain deployment: timing, process, and required code changes.**
 
@@ -445,67 +544,127 @@ MGC hosts client LPs under `{slug}.recruitly.jp` (e.g. `cloq.recruitly.jp`). Thi
 
 **When to deploy:** Only after the client has confirmed the LP is ready to go live. Do NOT set up the subdomain speculatively during bootstrap — the vercel URL (`nippo-sync.vercel.app/lp/{slug}`) is sufficient for review and iteration.
 
-**Who creates the DNS record:** Currently Jayden asks 松尾さん to add the CNAME at recruitly.jp's DNS provider (muubuu). In future Jayden will have direct access to muubuu to do this himself. The record needed is:
-```
-{slug}.recruitly.jp  CNAME  cname.vercel-dns.com
-```
+> ### 🛑 歯止め — read before touching DNS or Vercel
+>
+> Four misconceptions cost real time on the meishou-sangyou go-live (2026-05-18). Internalise these:
+>
+> 1. **It is an `A` record, NOT a `CNAME`.** recruitly.jp uses ムームーDNS (muumuu-domain), which serves a flat `A {slug}.recruitly.jp → 76.76.21.21` per subdomain. `cname.vercel-dns.com` does NOT apply here — that is only for the generic client-owned-domain flow (RULE 12 / custom-domains.md §5b), which is a *different, rarely-used path*. Every real client to date is `*.recruitly.jp`.
+> 2. **The client does NOTHING.** recruitly.jp is MGC's own domain. There is no "client configures DNS" step, no 転送/forwarding, no client registrar involved. The client only ever receives the final URL + `/admin?first` link.
+> 3. **DNS and Vercel are TWO separate mandatory steps.** A subdomain needs (a) the `A` record in ムームーDNS *and* (b) the domain added to the Vercel `nippo-sync` project. The DNS record resolving is necessary but NOT sufficient — without the Vercel project registration the TLS handshake fails (`SSL_ERROR_SYSCALL`) even though `dig` looks correct. This is not the same thing as the dashboard `domain-attach` API (RULE 12).
+> 4. **The host can differ from the slug.** `meishou-sangyou` (slug) → `meishou.recruitly.jp` (host). Never assume `{slug}.recruitly.jp`. Confirm the exact host with the user. Also confirm WHICH slug when near-duplicates exist (`meishou-sangyo` vs `meishou-sangyou`).
+>
+> The clean canonical runbook is custom-domains.md §5. Follow it verbatim; do not improvise a flow for the user.
 
-**Code changes required in nippo-sync (2 files, then git push):**
+**Who creates the DNS record:** recruitly.jp's DNS is managed in the ムームーDNS control panel (muumuu-domain). Whoever has that access (Jayden, or 松尾さん on request) adds one record per subdomain — an **A record**, not a CNAME:
+```
+{slug-or-host}.recruitly.jp   A   76.76.21.21
+```
+`76.76.21.21` is Vercel's stable shared anycast IP. There is no wildcard `*.recruitly.jp` — each subdomain is an explicit A record. On the meishou-sangyou go-live the A record was already present (added ahead of time); only the Vercel registration step was missing — so always verify both independently.
 
-1. **`src/lib/lp-domains.ts`** — add the slug → canonical domain mapping:
+**Code changes required in nippo-sync (1 file only, then git push):**
+
+1. **`src/lib/lp-domains.ts`** — add the new client entry to `CUSTOM_DOMAINS`. The middleware is generic (`getSlugForHost()` reads from this map automatically) — no per-client middleware block needed anymore.
+
 ```typescript
-const CUSTOM_DOMAINS: Record<string, string> = {
-  cloq: 'https://cloq.recruitly.jp',
-  {slug}: 'https://{slug}.recruitly.jp',  // ← add this
+const CUSTOM_DOMAINS: Record<string, CustomDomainConfig> = {
+  cloq: {
+    host: 'cloq.recruitly.jp',
+    brandName: 'CLOQ',
+    brandColor: '#2673b8',
+    googleSiteVerification: [
+      'ZaoolhQMn9GQT24xPBvtSeTpd50ybnSTzLpPpBFXrwo',  // client (CLOQ)
+      'AMVEOMf-qfKg3AOLbo_biuWuOvJE_WIAZiMYy2W-FsE',  // Jayden (MGC)
+    ],
+  },
+  // ← add new client here:
+  {slug}: {
+    host: '{slug}.recruitly.jp',
+    brandName: '{CLIENT_NAME_SHORT}',   // uppercase, e.g. "ACME"
+    brandColor: '{primary_hex}',        // from extract_design.py
+    googleSiteVerification: [
+      'AMVEOMf-qfKg3AOLbo_biuWuOvJE_WIAZiMYy2W-FsE',  // Jayden (MGC) — always include
+      // client token optional — add if client wants their own GSC access
+    ],
+  },
 }
 ```
-This makes all canonical URLs, `og:url`, Organization JSON-LD, Breadcrumb JSON-LD, and internal links (job cards, nav, CTA buttons) automatically point to the recruitly.jp domain instead of the vercel URL.
 
-2. **`src/middleware.ts`** — add routing for the new subdomain so requests to `{slug}.recruitly.jp` are rewritten to `/lp/{slug}`:
-```typescript
-if (host === '{slug}.recruitly.jp') {
-  if (pathname.startsWith('/_next/') || pathname.startsWith('/api/')) {
-    return NextResponse.next()
-  }
-  const mapped =
-    pathname === '/' || pathname === ''  ? '/lp/{slug}'
-    : pathname === '/admin'             ? '/lp/{slug}/admin'
-    : pathname === '/privacy'           ? '/lp/{slug}/privacy'
-    : pathname === '/entry'             ? '/lp/{slug}/entry'
-    : pathname.startsWith('/jobs/')     ? `/lp/{slug}${pathname}`
-    : null
-  if (mapped) {
-    const url = req.nextUrl.clone()
-    url.pathname = mapped
-    return NextResponse.rewrite(url)
-  }
-  return new NextResponse(BRANDED_404_HTML, { status: 404, headers: { 'content-type': 'text/html; charset=utf-8' } })
-}
+This one change automatically handles: canonical URLs, `og:url`, Organization/Breadcrumb JSON-LD, internal links, middleware routing, robots.txt Sitemap pointer, per-LP sitemap `<loc>` values, and branded 404 page. Nothing else to touch.
+
+2. **Vercel domain registration (separate mandatory step — code push alone is NOT enough)** — the host must be added to the `nippo-sync` Vercel project or every request to it fails the TLS handshake (`SSL_ERROR_SYSCALL`). From `nippo-sync-local/`, the CLI way (this is what worked on the meishou-sangyou go-live):
+```bash
+cd /Users/jayden.csai/Developer/nippo-sync-local
+vercel domains add {host}.recruitly.jp                 # e.g. vercel domains add meishou.recruitly.jp
+vercel domains inspect recruitly.jp                    # confirm: nippo-sync project's domain list now includes {host}.recruitly.jp
 ```
-(Copy the cloq block as a template and swap `cloq` → `{slug}`. Also create a branded 404 HTML constant for the new client matching their brand colors.)
+Do NOT use the `POST /api/lp/{slug}/admin/domain-attach` endpoint here — that is the client-self-serve dashboard flow for *client-owned* domains (RULE 12), a different path. Conflating the two cost time on the meishou go-live.
 
-3. **Vercel domain registration** — after pushing the code, register the domain in Vercel so it routes correctly. The domain-attach endpoint at `POST /api/lp/{slug}/admin/domain-attach` handles this, OR do it manually via the Vercel dashboard under the nippo-sync project → Domains → Add.
+**Full checklist (canonical recruitly.jp go-live runbook — follow in order, do not improvise):**
+1. ✅ Client confirms LP is ready. **Confirm the exact slug AND the exact host with the user** — host can differ from slug (`meishou-sangyou` → `meishou.recruitly.jp`), and near-duplicate slugs exist (`meishou-sangyo` vs `meishou-sangyou`). Query `public.lps` to disambiguate.
+2. ✅ **DNS — `A` record in ムームーDNS (NOT CNAME, NOT client DNS, NOT 転送).** Whoever has muumuu-domain access (Jayden, or 松尾さん on request) adds: `{host}.recruitly.jp   A   76.76.21.21`. Verify it resolves: `dig {host}.recruitly.jp A @8.8.8.8 +short` → `76.76.21.21`. (On the meishou go-live this record was already present — always verify rather than assume it's missing OR present.)
+3. ✅ Edit `nippo-sync-local/src/lib/lp-domains.ts` (the only copy that matters — it's what Vercel builds). Add the slug → host entry to `CUSTOM_DOMAINS`. `host:` = the actual host, key = the actual slug; they may differ. (There is no second `template/` copy to keep in sync.)
+4. ✅ **Localhost test before pushing** — `cd /Users/jayden.csai/Developer/nippo-sync-local && npm run dev`, then:
+   ```bash
+   curl -s http://localhost:3000/lp/{slug} | grep -i "{client_name}"   # confirm LP renders
+   curl -s http://localhost:3000/lp/{slug} | grep "canonical"           # confirm canonical URL is correct
+   curl -s http://localhost:3000/lp/{slug}/jobs/0 | grep "JobPosting"  # confirm schema present
+   ```
+   If any check fails, fix the issue before pushing. Never push to Vercel without passing localhost.
+5. ✅ `git push origin main` → Vercel auto-deploys (middleware routing is automatic, ~60s)
+6. ✅ **Register host in Vercel** — `vercel domains add {host}.recruitly.jp` from `nippo-sync-local/`, then `vercel domains inspect recruitly.jp` to confirm. This is mandatory and separate from steps 2 and 5.
+7. ✅ Persist to DB: `UPDATE public.lps SET custom_domain = '{host}.recruitly.jp' WHERE slug = '{slug}';`
+8. ✅ Verify production: `curl -sI https://{host}.recruitly.jp` → HTTP 200 (if `SSL_ERROR_SYSCALL`, step 6 was missed or TLS still provisioning — wait ~1 min and retry), then `curl -s https://{host}.recruitly.jp | grep canonical` → should show `https://{host}.recruitly.jp`
+9. ✅ **GSC + Indexing API setup** — add the MGC service account as Owner in Google Search Console for the new domain (see RULE 16). Without this, the auto-ping fires but gets 403 Permission Denied and the jobs pages won't be fast-tracked.
+10. ✅ **Re-fire Indexing API with canonical custom domain URLs** — The initial bootstrap save happened *before* the domain was registered in `lp-domains.ts`, so `notifyIndexingApiForLp()` used the `nippo-sync.vercel.app/lp/{slug}/jobs/{i}` fallback URLs. Google needs to be re-notified with the correct `https://{slug}.recruitly.jp/jobs/{i}` URLs.
 
-**Full checklist:**
-1. ✅ Client confirms LP is ready
-2. ✅ Ask 松尾さん (or use muubuu directly when access granted) to add CNAME: `{slug}.recruitly.jp → cname.vercel-dns.com`
-3. ✅ Update `src/lib/lp-domains.ts` — add slug → domain entry
-4. ✅ Update `src/middleware.ts` — add routing block for new subdomain
-5. ✅ `git push origin main` → Vercel auto-deploys
-6. ✅ Register domain in Vercel (dashboard or domain-attach API)
-7. ✅ Wait for DNS propagation (5–30 min typical)
-8. ✅ Verify: `curl -sI https://{slug}.recruitly.jp` → HTTP 200, then `curl -s https://{slug}.recruitly.jp | grep canonical` → should show `https://{slug}.recruitly.jp`
+    **How:** After GSC ownership is confirmed (step 9), open `https://{slug}.recruitly.jp/admin`, log in, and click **Save** (no content changes needed — any save triggers `notifyIndexingApiForLp()`). This will fire `URL_UPDATED` for all `/jobs/N` URLs using the now-registered custom domain canonical base.
+
+    **Verify:** Check Vercel logs immediately after saving:
+    ```
+    [indexing] slug={slug} urls=N ok=N failed=0 skipped=false
+    ```
+    The log line must show the custom domain hostname (e.g. `cloq.recruitly.jp`) — if it still shows `nippo-sync.vercel.app`, confirm that `lp-domains.ts` was actually deployed (step 5) and that the deploy completed.
+
+    **If the admin save is not accessible** (e.g. LP has no sheet connected yet), call the indexing endpoint directly:
+    ```bash
+    curl -X POST "https://{slug}.recruitly.jp/api/lp/{slug}/index" \
+      -H "x-migration-secret: $(doppler secrets get MIGRATION_SECRET --project nippo-syncro-kun --config dev --plain)"
+    ```
+    If that endpoint doesn't exist yet, fall back to the admin save approach.
+
+**RULE 16 — Google Search Console ownership + Indexing API fast-track: required per new subdomain.**
+
+Every new `{slug}.recruitly.jp` must have the MGC service account added as an **Owner** in Google Search Console before the Indexing API auto-ping will work. Without this, every save fires a ping that returns `403 PERMISSION_DENIED` and the `/jobs/N` pages are not fast-tracked — they sit in Google's normal discovery queue for days or weeks.
+
+**Why this matters:** The Indexing API short-circuits Google's discovery queue specifically for `JobPosting` structured data (which every `/jobs/[index]` page emits). It's what converts "indexed in 2-4 weeks" to "indexed in a few hours". Every LP has the code wired — the blocker is always the GSC ownership step.
+
+**One-time setup per new subdomain:**
+1. Go to https://search.google.com/search-console/users?resource_id=https://{slug}.recruitly.jp/
+2. Click **Add user** → paste the service account `client_email` from `GOOGLE_SERVICE_ACCOUNT_JSON` Vercel env → set permission to **Owner** (not "Full user" — the Indexing API specifically requires Owner)
+3. Click Save
+
+**Verify it worked:** trigger a save on the LP admin, then check Vercel logs for:
+```
+[indexing] slug={slug} urls=2 ok=2 failed=0 skipped=false
+```
+If you see `ok=2` — Google has been notified, pages index within hours. If `failed=2` — SA isn't Owner yet, or the Indexing API isn't enabled on the Google Cloud project (`console.cloud.google.com/apis/library/indexing.googleapis.com`).
+
+**Future-proof option:** Verify the entire `recruitly.jp` domain once via DNS TXT record (Google Search Console → Add property → Domain → `recruitly.jp`). This makes the service account an Owner of ALL `*.recruitly.jp` subdomains automatically — new client LPs are covered with zero extra GSC steps. Requires DNS access to `recruitly.jp` at muubuu (松尾さん or Jayden when access is granted).
+
+**Quota:** the Indexing API allows 200 URL_UPDATED notifications/day per Google Cloud project by default. At ~2 jobs per LP, that's 100 LPs before hitting quota. Request a quota increase via Google Cloud Console if the portfolio grows past that.
+
+---
 
 **RULE 14 — Images should be 融合 of original style + generated content, NOT reused homepage photos.** The cloq build violated this on first pass — I grabbed images from cloq.jp's existing pages and stuck them on the 採用LP as-is. That's lazy and produces a LP that looks like a 切り貼り (cut-and-paste) of the client's existing site. The correct approach:
 
 1. **KEEP the style** from the reference site: colors, typography, layout feel, logo placement, section hierarchy. These come from `extract_design.py` + Aura + the scraped CSS tokens. Don't touch.
-2. **GENERATE new images** based on the company's actual concepts via nano-banana-proxy skill. The prompt should reference what makes THIS company THIS company: their industry, their values (from `bundle.representative_message` + `business_descriptions`), their culture (from scraped job_details 求める人物像). A recruitment consultancy's 採用LP hero should show "recruitment consulting with candidates in a modern Kyoto office", not their homepage's generic business banner.
-3. **USE scraped photos only when they're genuinely workspace-specific** — actual building exteriors, actual desks with people working, actual team photos. NOT marketing hero banners, NOT stock-photo-looking abstracts, NOT the site's og:image. The test: "would this photo make sense in a job-seeker context?" Building photo = yes. Homepage hero banner = no.
-4. **Position images** (one per opening) should be **generated fresh per role** via nano-banana. A "採用支援スタッフ" role gets an image of a support staffer working with candidates; a "採用クリエイター" role gets an image of a writer at a laptop drafting copy. NOT a generic homepage image used twice.
-5. **About photo** can be a real company building photo if one exists, otherwise generate.
+2. **GENERATE new images** based on the company's actual concepts via the shared `codex-imagegen-first` skill (`/Users/jayden.csai/Developer/agent-infra/skills/codex-imagegen-first/SKILL.md`). The default provider is Codex built-in `image_gen` / `gpt-image-2`, usually invoked from another local agent with `/Users/jayden.csai/local/node/bin/codex exec`. Do not use `nano-banana`, `gemini_generate_image`, `/banana`, or MCP image generators unless Jayden explicitly asks for that provider or approves fallback.
+3. **USE scraped/downloaded photos as references only** — official-site and web image search results are for understanding uniforms, work context, business line, entity, and visual style. They must not be written directly into `lp_content` body/job image fields. The only direct-use exceptions are `header.logo_image` and `header.favicon_url` when the logo/icon is from the official company site.
+4. **Position images** (one per opening) must be **generated fresh per role**. A "採用支援スタッフ" role gets an image of a support staffer working with candidates; a "採用クリエイター" role gets an image of a writer at a laptop drafting copy. NOT a generic homepage image used twice.
+5. **About photo** must be generated from the company profile and approved reference images; do not use a real building/workplace photo directly in the final LP unless Jayden explicitly approves a direct-use exception.
 6. **Voices[].photo** — always generated placeholders unless the client provides real employee photos with consent. Flag as `voices_photo: "ai_placeholder"` in provenance.
 
-The image pipeline hasn't been folded into `scripts/` yet — it's a manual step invoking the `nano-banana-proxy` skill after the text content is inserted. Until it's folded in: document it in the polish checklist at handoff and actually RUN the generation before declaring the LP ready to hand over. **Never ship a LP with pure scraped-homepage-reuse images.**
+The current bootstrap enforces this in two places: `compose_lpcontent.py` strips scraped/source photos out of final body/job/voice slots, and `validate_lp_json.py --strict --for-apply` plus the protected import route reject apply unless those slots point to approved `image_generation.generated_assets`. **Never ship a LP with pure scraped-homepage-reuse images.**
 
 **RULE 15 — NEVER use the `spreadsheets` OAuth scope or any other sensitive scope.** See Critical Constraints #2 above. This is a non-negotiable: adding it back kicks us into Google's verification track and costs weeks of calendar time. `drive.file` + `userinfo.email` + `openid` is the complete allowed list. If a future feature seems to need `spreadsheets` scope, find a way to do it with `drive.file` instead — the app is always the creator of any sheet it touches, and `drive.file` is sufficient for every operation on app-created files.
 
@@ -566,6 +725,22 @@ These tags are used by THREE consumers: (1) the OAuth callback handover transact
 Inside opening cards, the per-card **`編集 →`** buttons (blue, right-aligned, one per job) open the nested OpeningDetailEditor for that specific job's /jobs/N detail page. These are separate from the main 3 header buttons and do not navigate away — they expand a nested form inline.
 
 Never merge or rename these without updating this rule. Confusing labels cost hours of user support because the distinction between "preview with unsaved changes" vs "see the actually-live site" is subtle but important. Precedent commit: `dc7d513`.
+
+**RULE 24 — The ONLY source of truth for LP code is the deployed `nippo-sync` repo: `~/Developer/nippo-sync-local/src/` (GitHub `jaydenbarnescs-tech/nippo-sync`, branch `main`). That is literally what Vercel builds. The old `template/` snapshot is DEPRECATED — never read it as a baseline, never edit it, never "sync" it.**
+
+History (why this rule was rewritten): a `template/` mirror used to live in this skill, and the old RULE 24 (2026-04-26) wrongly called it "the source of truth." It was a hand-maintained second copy that **drifted** out of sync, was **never deployed** (Vercel builds the nippo-sync repo, not this folder), and was **never read by any script** — so it carried no authority, only the power to mislead. On 2026-06-16 it caused a near-regression: an agent baselined off the stale snapshot (which was missing the live Instagram + multi-JobPosting code) and nearly shipped a regression. It is retired. `docs/deploy.md` (the template↔nippo-sync copy workflow) is **obsolete — ignore it**.
+
+**When making any LP code change:**
+1. `cd ~/Developer/nippo-sync-local && git fetch origin && git status` — confirm you're on `origin/main` with no surprise drift, then read/edit files under `src/`.
+2. `npx tsc --noEmit`, then test on localhost (`npm run dev`, curl `http://localhost:3000/lp/{slug}`).
+3. If it passes → commit **only your files** + push to `main` → Vercel auto-deploys.
+4. Verify on production with `curl` (root 200 + your marker present, and existing LPs still 200).
+
+**Never run two agents against this working tree / branch at the same time** — Git has no lock on a shared checkout, so concurrent edits silently clobber each other.
+
+**The tsc + localhost test is mandatory before every production push.** A bad deploy can break all client LPs simultaneously (they share the nippo-sync codebase). It catches >90% of mistakes before they reach clients. Always run it.
+
+Note: `docs/deploy.md` documents the **retired** `template/`-copy workflow and is obsolete — ignore it. The file map in `docs/architecture.md` still applies, mapping the same paths directly under `nippo-sync-local/src/`.
 
 ---
 
@@ -748,7 +923,7 @@ If something goes wrong post-bootstrap, check this list before digging:
 
 | Symptom | Most likely cause | Fix |
 |---|---|---|
-| `/lp/{slug}/admin` returns "LPが見つかりません" | Step 10.3 skipped — `lp_admins` has no row | `INSERT INTO lp_admins` for Jayden (owner) + `.cs@gmail.com` (member) |
+| `/lp/{slug}/admin` returns "LPが見つかりません" | Step 10.3 skipped — `lp_admins` has no row | Run the step 10.3 standard-team upsert (5 rows from `STANDARD_TEAM_ADMINS`), not just Jayden+`.cs` |
 | `/lp/{slug}/entry` dropdown shows wrong positions | You're hitting the legacy static HTML path somehow | Verify `src/app/lp/[slug]/entry/route.ts` exists; check that no `public/lp/{slug}/entry/index.html` exists |
 | Sheet sync stops working | `lp_admins.google_refresh_token` is NULL for the current owner | The owner needs to re-OAuth: visit `/lp/{slug}/admin` in an incognito window → click Google sign-in |
 | Link preview shows "日報シンクロくん" | OG cache in the unfurler (Slack/iMessage/LINE), not a server bug — check the actual HTML via curl first | Use Slack's OG debugger OR add `?first&v=2` to bust iMessage's cache. Verify server-side with `curl $URL \| grep og:title` |
@@ -826,7 +1001,7 @@ curl -s https://nippo-sync.vercel.app/lp/yamaguchi | grep -c '日報シンクロ
 # Expected: 0
 
 # 3. Vercel env vars needed by domain-attach are present
-# (run from the VM; reads Jayden's Vercel token from Doppler)
+# (run locally; reads Jayden's Vercel token from Doppler)
 VERCEL_TOKEN=$(doppler secrets get VERCEL_TOKEN --project nippo-syncro-kun --config dev --plain)
 curl -sk "https://api.vercel.com/v9/projects/prj_le2vOYHWk48qXpSiVzaMGIzDs2Dc/env?teamId=team_InumbXmdUdRp3WpMs47TFd8s" \
   -H "Authorization: Bearer $VERCEL_TOKEN" | python3 -c "
@@ -865,12 +1040,12 @@ curl -s -w '\nHTTP %{http_code}\n' https://nippo-sync.vercel.app/api/lp/yamaguch
 
 ```bash
 # Confirm none of Matsuo-san's services are touched by this session
-systemctl is-active mgc-connector-hub.service 2>/dev/null && echo "matsuo connector-hub: running (leave alone)" || echo "matsuo connector-hub: not on this VM or stopped"
-systemctl is-active line-crm.service 2>/dev/null && echo "matsuo line-crm: running (leave alone)" || echo "matsuo line-crm: not on this VM or stopped"
-systemctl is-active n8n-koko.service 2>/dev/null && echo "matsuo n8n-koko: running (leave alone)" || echo "matsuo n8n-koko: not on this VM or stopped"
+systemctl is-active mgc-connector-hub.service 2>/dev/null && echo "matsuo connector-hub: running (leave alone)" || echo "matsuo connector-hub: not on this shared server or stopped"
+systemctl is-active line-crm.service 2>/dev/null && echo "matsuo line-crm: running (leave alone)" || echo "matsuo line-crm: not on this shared server or stopped"
+systemctl is-active n8n-koko.service 2>/dev/null && echo "matsuo n8n-koko: running (leave alone)" || echo "matsuo n8n-koko: not on this shared server or stopped"
 # Just READ the status. NEVER restart. If any are running, proceed carefully — do NOT `git pull` or `systemctl restart` anything under /home/ubuntu/mgc-connector-hub/, /home/ubuntu/nippo-sync-koko/, or /home/ubuntu/line-harness-oss/
 ls -la /home/ubuntu/nippo-sync/ > /dev/null && echo "✓ jayden's nippo-sync present"
-ls -la /home/ubuntu/mgc-saiyo-lp-bootstrap/ > /dev/null && echo "✓ bootstrap skill present"
+test -d ~/.claude/skills/mgc-saiyo-lp-bootstrap && echo "✓ laptop-local bootstrap skill present"
 ```
 
 ### D. If the pre-flight fails
@@ -900,13 +1075,11 @@ Zero client-side DNS changes needed — existing custom domains keep working bec
 
 ## How Claude should invoke this skill
 
-When the trigger fires, Claude does NOT manually run all 13 steps from a chat. Instead, Claude calls:
+When the trigger fires, Claude does NOT manually run all 13 steps from a chat. Instead, Claude runs the laptop-local bootstrap:
 
 ```
-Custom Proxy:server_exec(
-  command="cd /home/ubuntu/mgc-saiyo-lp-bootstrap && python3 scripts/bootstrap.py --slug {slug} --client-name '{name}' --primary-url '{url}' [--style-url '{url}'] [--overwrite]",
-  working_dir="/home/ubuntu/mgc-saiyo-lp-bootstrap"
-)
+cd ~/.claude/skills/mgc-saiyo-lp-bootstrap
+python3 scripts/bootstrap.py --slug {slug} --client-name '{name}' --primary-url '{url}' [--style-url '{url}'] [--industry '{industry}']
 ```
 
 The `bootstrap.py` orchestrator runs all 13 steps and returns a JSON status report. Claude then formats the report for the user.
@@ -924,7 +1097,7 @@ mgc-saiyo-lp-bootstrap/
 ├── references/                    ← design-time reference docs (not executed)
 │   ├── lp-content-schema.md       ← copy of LpContent type
 │   ├── content-extraction.md      ← multi-page crawl strategy + selectors
-│   ├── image-pipeline.md          ← image strategy + nano-banana prompts
+│   ├── image-pipeline.md          ← image strategy + Codex image-generation prompts
 │   ├── ai-gap-fill.md             ← prompts for generating missing sections
 │   └── industry-presets.md        ← how to load + apply presets
 └── scripts/
@@ -932,7 +1105,7 @@ mgc-saiyo-lp-bootstrap/
     ├── crawl_reference.py         ← multi-page crawler → ContentBundle (with logo + dl extraction)
     ├── extract_design.py          ← Aura wrapper with CSS-fallback
     ├── compose_lpcontent.py       ← merges ContentBundle + design tokens + preset → LpContent
-    ├── image_pipeline.py          ← concept-aware nano-banana-pro-preview generation (folded in 2026-04-09)
+    ├── image_pipeline.py          ← legacy nano-banana fallback, disabled unless explicitly approved
     └── analytics_bootstrap.py     ← analytics tables verification + tracking pixel verification + demo data seed (folded in 2026-04-09, step 12.7)
 ```
 
